@@ -24,10 +24,10 @@ resource "oci_core_instance" "a1" {
   }
 
   create_vnic_details {
-    subnet_id       = oci_core_subnet.main.id
+    subnet_id        = oci_core_subnet.main.id
     assign_public_ip = var.assign_public_ip
-    display_name    = "${var.name_prefix}-vnic"
-    hostname_label  = "a1host"
+    display_name     = "${var.name_prefix}-vnic"
+    hostname_label   = "a1host"
   }
 
   source_details {
@@ -36,12 +36,12 @@ resource "oci_core_instance" "a1" {
   }
 
   metadata = {
-    ssh_authorized_keys = trim(var.ssh_public_key)
+    ssh_authorized_keys = trimspace(var.ssh_public_key)
   }
 
   lifecycle {
     precondition {
-      condition     = local.selected_image_id != null && length(trim(local.selected_image_id)) > 0
+      condition     = local.selected_image_id != null && length(trimspace(local.selected_image_id)) > 0
       error_message = "Set image_ocid_override to a known-good ARM Ubuntu 24.04 image OCID for this region."
     }
   }

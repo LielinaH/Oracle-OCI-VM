@@ -88,5 +88,5 @@ function Test-StepFailures {
         [object[]]$Board
     )
 
-    return ($Board | Where-Object { $_.Status -eq "FAIL" }).Count -gt 0
+    return @($Board | Where-Object { $_.Status -eq "FAIL" }).Count -gt 0
 }

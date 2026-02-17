@@ -36,7 +36,7 @@ variable "availability_domain" {
   type        = string
 
   validation {
-    condition     = length(trim(var.availability_domain)) > 0
+    condition     = length(trimspace(var.availability_domain)) > 0
     error_message = "availability_domain cannot be empty."
   }
 }
@@ -112,7 +112,7 @@ variable "ssh_public_key" {
   type        = string
 
   validation {
-    condition     = can(regex("^ssh-", trim(var.ssh_public_key)))
+    condition     = can(regex("^ssh-", trimspace(var.ssh_public_key)))
     error_message = "ssh_public_key must start with ssh-."
   }
 }

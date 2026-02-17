@@ -52,11 +52,25 @@ function Convert-OciRawList {
         }
     }
 
-    $items = @($trimmed -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-    if ($items.Count -eq 1 -and $items[0] -match "\s+") {
-        $items = @($items[0] -split "\s+" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-    }
-    return $items
+    $items = @($trimmed -split "[,\r\n]" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    return @(
+        $items |
+        Where-Object { $_ -notmatch "^Error while loading conda entry point" } |
+        ForEach-Object { $_.Replace("[", "").Replace("]", "").Replace('"', "").Trim() } |
+        Where-Object { $_ -ne "" }
+    )
+}
+
+function Get-CleanOciLines {
+    param(
+        [string]$RawText
+    )
+
+    return @(
+        $RawText -split "\r?\n" |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne "" -and $_ -notmatch "^Error while loading conda entry point" }
+    )
 }
 
 function Test-Ipv4Cidr {
@@ -193,7 +207,9 @@ try {
             "--raw-output"
         )
         if ($nsResult.ExitCode -eq 0) {
-            End-Step -Index $currentStep -Status "PASS" -Details "Namespace: $($nsResult.Output.Trim())"
+            $cleanNs = @(Get-CleanOciLines -RawText $nsResult.Output)
+            $nsValue = if ($cleanNs.Count -gt 0) { $cleanNs[$cleanNs.Count - 1] } else { $nsResult.Output.Trim() }
+            End-Step -Index $currentStep -Status "PASS" -Details "Namespace: $nsValue"
         }
         else {
             End-Step -Index $currentStep -Status "FAIL" -Details "oci os ns get failed: $($nsResult.Output)"
@@ -237,6 +253,7 @@ try {
         }
         else {
             $ads = @(Convert-OciRawList -RawText $adResult.Output | Sort-Object -Unique)
+            $ads = @($ads | Where-Object { $_ -match "-AD-" } | Sort-Object -Unique)
             if ($ads.Count -ge 1) {
                 End-Step -Index $currentStep -Status "PASS" -Details "Found $($ads.Count) AD(s): $($ads -join ', ')"
             }
@@ -319,7 +336,7 @@ try {
     }
 
     $hasFailure = Test-StepFailures -Board $board
-    $hasWarnings = ($board | Where-Object { $_.Status -eq "WARN" }).Count -gt 0
+    $hasWarnings = @($board | Where-Object { $_.Status -eq "WARN" }).Count -gt 0
 
     if ($hasFailure) {
         $summaryText = "One or more steps failed."

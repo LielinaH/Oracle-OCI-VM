@@ -1,7 +1,7 @@
 locals {
   instance_public_ip       = try(data.oci_core_vnic.primary_vnic.public_ip_address, "")
   instance_private_ip      = try(data.oci_core_vnic.primary_vnic.private_ip_address, "")
-  ssh_private_key_location = length(trim(var.ssh_private_key_path_hint)) > 0 ? var.ssh_private_key_path_hint : "<path-to-private-key>"
+  ssh_private_key_location = length(trimspace(var.ssh_private_key_path_hint)) > 0 ? var.ssh_private_key_path_hint : "<path-to-private-key>"
 }
 
 output "instance_ocid" {
@@ -26,7 +26,5 @@ output "private_ip" {
 
 output "ssh_command_powershell" {
   description = "Ready-to-run SSH command for Windows PowerShell."
-  value = local.instance_public_ip != "" ?
-    "ssh -i \"${local.ssh_private_key_location}\" ubuntu@${local.instance_public_ip}" :
-  "Public IP not available. Verify assign_public_ip=true and subnet routing/security rules."
+  value       = local.instance_public_ip != "" ? "ssh -i \"${local.ssh_private_key_location}\" ubuntu@${local.instance_public_ip}" : "Public IP not available. Verify assign_public_ip=true and subnet routing/security rules."
 }
