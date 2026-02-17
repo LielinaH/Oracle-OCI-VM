@@ -96,6 +96,9 @@ Optional flags:
 -Deterministic
 -OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"
 -TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"
+-AllowRootCompartment
+-AllowExistingNamedResources
+-ForceTakeLock
 -PromptOciPrivateKeyPassword
 # less preferred: -OciPrivateKeyPassword "<passphrase>"
 -Ocpus 1
@@ -140,6 +143,16 @@ pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoAppr
 ### Terraform command resolution issues
 - If `terraform` is installed but scripts say it is missing, set:
   `-TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"`
+
+### Safety Guards (Duplicate Prevention)
+- `apply-retry.ps1` blocks root tenancy as `-CompartmentOcid` by default. Use a child compartment for safer loops.
+- You can bypass this only with `-AllowRootCompartment` (not recommended for repeated loops).
+- `apply-retry.ps1` writes a lock file at `.apply-retry.lock` to prevent parallel apply loops from running at once.
+- If a lock exists, apply stops with a safety error. Use `-ForceTakeLock` only when you are sure no other apply process is active.
+- Before apply, the script compares Terraform state with OCI VCNs:
+  - if an existing `name_prefix-vcn` is found but state does not include `oci_core_vcn.main`, apply stops by default to prevent duplicate stacks.
+  - if multiple `name_prefix-vcn` resources already exist, apply stops by default.
+  - use `-AllowExistingNamedResources` only when you intentionally want to bypass this guard.
 
 ### No public IP / SSH not reachable
 - Verify route table has `0.0.0.0/0 -> Internet Gateway`.

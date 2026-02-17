@@ -19,6 +19,9 @@ param(
     [switch]$Deterministic,
     [string]$OciCliPath,
     [string]$TerraformPath,
+    [switch]$AllowRootCompartment,
+    [switch]$AllowExistingNamedResources,
+    [switch]$ForceTakeLock,
     [string]$OciPrivateKeyPassword,
     [switch]$PromptOciPrivateKeyPassword,
     [int]$Ocpus = 1,
@@ -136,6 +139,25 @@ function Get-CleanOciLines {
     )
 }
 
+function Convert-OciJsonSafe {
+    param(
+        [string]$RawText
+    )
+
+    $cleanLines = @(Get-CleanOciLines -RawText $RawText)
+    if ($cleanLines.Count -eq 0) {
+        return $null
+    }
+
+    $jsonText = $cleanLines -join [Environment]::NewLine
+    try {
+        return ($jsonText | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Convert-ToTerraformStringLiteral {
     param(
         [string]$Value
@@ -210,6 +232,8 @@ $steps = @(
 $activity = "apply-retry.ps1 progress"
 $board = New-StepBoard -StepNames $steps
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$lockPath = Join-Path $projectRoot ".apply-retry.lock"
+$lockHeld = $false
 $exitCode = 1
 $currentStep = 0
 $summaryDone = $false
@@ -218,6 +242,7 @@ $ociAvailable = $false
 $ociExecutable = ""
 $terraformAvailable = $false
 $terraformExecutable = ""
+$stateHasManagedVcn = $false
 $sshPublicKey = ""
 $privateKeyHint = "<path-to-private-key>"
 $effectiveAllowedSshCidr = ""
@@ -293,11 +318,18 @@ try {
     if (-not $TenancyOcid.StartsWith("ocid1.tenancy.", [System.StringComparison]::OrdinalIgnoreCase)) {
         $validationIssues += "TenancyOcid is not a valid tenancy OCID."
     }
+    $isRootCompartment = $CompartmentOcid.StartsWith("ocid1.tenancy.", [System.StringComparison]::OrdinalIgnoreCase)
     if (
         -not $CompartmentOcid.StartsWith("ocid1.compartment.", [System.StringComparison]::OrdinalIgnoreCase) -and
-        -not $CompartmentOcid.StartsWith("ocid1.tenancy.", [System.StringComparison]::OrdinalIgnoreCase)
+        -not $isRootCompartment
     ) {
-        $validationIssues += "CompartmentOcid must be a compartment/root-tenancy OCID."
+        $validationIssues += "CompartmentOcid must be a valid OCI compartment OCID."
+    }
+    elseif ($isRootCompartment -and -not $AllowRootCompartment) {
+        $validationIssues += "Safety stop: root tenancy OCID was passed as CompartmentOcid. Use a dedicated child compartment, or override intentionally with -AllowRootCompartment."
+    }
+    elseif ($isRootCompartment -and $AllowRootCompartment) {
+        $validationWarnings += "Root tenancy is being used as compartment because -AllowRootCompartment was provided."
     }
     if ($PromptOciPrivateKeyPassword -and -not [string]::IsNullOrWhiteSpace($OciPrivateKeyPassword)) {
         $validationIssues += "Use only one of -PromptOciPrivateKeyPassword or -OciPrivateKeyPassword."
@@ -309,6 +341,25 @@ try {
     $terraformAvailable = -not [string]::IsNullOrWhiteSpace($terraformExecutable)
     if (-not $ociAvailable) { $validationIssues += "oci CLI executable not found. Use -OciCliPath `"C:\Program Files (x86)\Oracle\oci_cli\oci.exe`"." }
     if (-not $terraformAvailable) { $validationIssues += "terraform executable not found. Use -TerraformPath `"C:\Users\<you>\AppData\Local\Microsoft\WinGet\Links\terraform.exe`"." }
+
+    if ($validationIssues.Count -eq 0 -and (Test-Path -Path $lockPath)) {
+        if ($ForceTakeLock) {
+            Remove-Item -Path $lockPath -Force -ErrorAction SilentlyContinue
+            $validationWarnings += "Existing lock file was removed due to -ForceTakeLock."
+        }
+        else {
+            $lockInfo = ""
+            if (Test-Path -Path $lockPath) {
+                $lockInfo = (Get-Content -Path $lockPath -Raw -ErrorAction SilentlyContinue).Trim()
+            }
+            if ([string]::IsNullOrWhiteSpace($lockInfo)) {
+                $validationIssues += "Safety stop: lock file exists at $lockPath. Another apply-retry process may still be running."
+            }
+            else {
+                $validationIssues += "Safety stop: lock file exists at $lockPath. Another apply-retry process may still be running. Lock info: $lockInfo"
+            }
+        }
+    }
 
     if ($validationIssues.Count -eq 0) {
         if ($PromptOciPrivateKeyPassword) {
@@ -341,6 +392,72 @@ try {
             $env:TF_VAR_private_key_password = $OciPrivateKeyPassword
             $ociPrivateKeyPasswordOverridden = $true
             $ociPrivateKeyPasswordSource = "parameter"
+        }
+    }
+
+    if ($validationIssues.Count -eq 0 -and $terraformAvailable) {
+        $stateListResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("state", "list")
+        if ($stateListResult.ExitCode -eq 0) {
+            $stateEntries = @(
+                $stateListResult.Output -split "\r?\n" |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -ne "" }
+            )
+            $stateHasManagedVcn = $stateEntries -contains "oci_core_vcn.main"
+        }
+        else {
+            $validationWarnings += "Could not inspect terraform state list before apply: $($stateListResult.Output)"
+        }
+    }
+
+    if ($validationIssues.Count -eq 0 -and $ociAvailable) {
+        $vcnListResult = Invoke-ExternalCapture -File $ociExecutable -Arguments @(
+            "network", "vcn", "list",
+            "--compartment-id", $CompartmentOcid,
+            "--all",
+            "--profile", $Profile,
+            "--region", $Region
+        )
+
+        if ($vcnListResult.ExitCode -eq 0) {
+            $vcnDoc = Convert-OciJsonSafe -RawText $vcnListResult.Output
+            if ($vcnDoc -and $vcnDoc.PSObject.Properties.Name -contains "data") {
+                $targetVcnName = "$NamePrefix-vcn"
+                $matchingNamedVcns = @(
+                    $vcnDoc.data |
+                    Where-Object {
+                        $_."display-name" -eq $targetVcnName -and
+                        $_."lifecycle-state" -ne "TERMINATED"
+                    }
+                )
+
+                if ($matchingNamedVcns.Count -gt 1 -and -not $AllowExistingNamedResources) {
+                    $validationIssues += "Safety stop: found $($matchingNamedVcns.Count) existing VCNs named '$targetVcnName' in compartment. This indicates duplicate stacks. Clean up first or rerun with -AllowExistingNamedResources."
+                }
+                elseif ($matchingNamedVcns.Count -ge 1 -and -not $stateHasManagedVcn -and -not $AllowExistingNamedResources) {
+                    $validationIssues += "Safety stop: found existing VCN '$targetVcnName' but terraform state does not track oci_core_vcn.main. This can create duplicates. Run from the original state folder, import state, or rerun with -AllowExistingNamedResources."
+                }
+                elseif ($matchingNamedVcns.Count -ge 1 -and -not $stateHasManagedVcn -and $AllowExistingNamedResources) {
+                    $validationWarnings += "Bypassing state/VCN safety guard because -AllowExistingNamedResources was provided."
+                }
+            }
+            else {
+                $validationWarnings += "Could not parse OCI VCN list output for duplicate-safety checks."
+            }
+        }
+        else {
+            $validationWarnings += "Could not run OCI VCN list duplicate-safety check: $($vcnListResult.Output)"
+        }
+    }
+
+    if ($validationIssues.Count -eq 0) {
+        $lockInfo = "pid=$PID; started_utc=$(([DateTime]::UtcNow).ToString('o')); script=apply-retry.ps1"
+        try {
+            Set-Content -Path $lockPath -Value $lockInfo -Encoding utf8NoBOM
+            $lockHeld = $true
+        }
+        catch {
+            $validationIssues += "Safety stop: unable to create lock file at $lockPath. $($_.Exception.Message)"
         }
     }
 
@@ -693,6 +810,10 @@ catch {
 }
 finally {
     Finish-ProgressUi -Activity $activity
+    if ($lockHeld) {
+        Remove-Item -Path $lockPath -Force -ErrorAction SilentlyContinue
+        $lockHeld = $false
+    }
     if ($ociPrivateKeyPasswordOverridden) {
         if ([string]::IsNullOrWhiteSpace($originalOciPrivateKeyPassword)) {
             Remove-Item Env:OCI_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
