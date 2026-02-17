@@ -1,0 +1,16 @@
+# Example values for manual Terraform usage.
+# Do not commit real secrets.
+
+compartment_ocid          = "ocid1.compartment.oc1..replace_me"
+region                    = "eu-frankfurt-1"
+oci_profile               = "DEFAULT"
+name_prefix               = "oci-a1-retry"
+allowed_ssh_cidr          = "203.0.113.10/32"
+ssh_public_key            = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... replace_me"
+ssh_private_key_path_hint = "C:\\Users\\YourUser\\.ssh\\id_ed25519"
+
+# Script-driven runs pass this per attempt.
+# availability_domain = "YOUR-AD-NAME"
+
+# Optional deterministic image pinning:
+# image_ocid_override = "ocid1.image.oc1.eu-frankfurt-1...."
