@@ -74,6 +74,7 @@ pwsh .\scripts\doctor.ps1 `
 Optional strict region enforcement:
 ```powershell
 -EnforceRegion "eu-frankfurt-1"
+-OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"
 ```
 
 ### 2) Apply With AD Retry
@@ -92,6 +93,9 @@ Optional flags:
 -AllowedSshCidr "203.0.113.10/32"
 -EnforceRegion "eu-frankfurt-1"
 -Deterministic
+-OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"
+-PromptOciPrivateKeyPassword
+# less preferred: -OciPrivateKeyPassword "<passphrase>"
 -Ocpus 1
 -MemoryInGbs 6
 ```
@@ -125,6 +129,10 @@ pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoAppr
 ### Region mismatch behavior
 - By default, non-`eu-frankfurt-1` regions produce `WARN` and continue.
 - With `-EnforceRegion`, mismatch produces `FAIL`.
+
+### OCI CLI command resolution issues
+- If you see `Get-Acl`/module-load errors while running `oci` from script, force the executable:
+  `-OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"`
 
 ### No public IP / SSH not reachable
 - Verify route table has `0.0.0.0/0 -> Internet Gateway`.

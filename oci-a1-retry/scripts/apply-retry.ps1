@@ -17,6 +17,9 @@ param(
     [int]$SshWaitTimeoutSeconds = 180,
     [string]$EnforceRegion,
     [switch]$Deterministic,
+    [string]$OciCliPath,
+    [string]$OciPrivateKeyPassword,
+    [switch]$PromptOciPrivateKeyPassword,
     [int]$Ocpus = 1,
     [int]$MemoryInGbs = 6
 )
@@ -25,13 +28,53 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_common.ps1"
 
-$TenancyOcid = $TenancyOcid.Trim()
-$CompartmentOcid = $CompartmentOcid.Trim()
+function Normalize-OcidInput {
+    param(
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    $normalized = $Value.Trim()
+    $normalized = $normalized.Trim('"').Trim("'")
+    $normalized = [regex]::Replace($normalized, "\s+", "")
+    $normalized = [regex]::Replace($normalized, "\p{Cf}", "")
+    return $normalized
+}
+
+$TenancyOcid = Normalize-OcidInput -Value $TenancyOcid
+$CompartmentOcid = Normalize-OcidInput -Value $CompartmentOcid
 $Region = $Region.Trim()
 $Profile = $Profile.Trim()
 $NamePrefix = $NamePrefix.Trim()
 $AllowedSshCidr = if ($AllowedSshCidr) { $AllowedSshCidr.Trim() } else { $null }
 $EnforceRegion = if ($EnforceRegion) { $EnforceRegion.Trim() } else { $null }
+$OciCliPath = if ($OciCliPath) { $OciCliPath.Trim() } else { $null }
+$OciPrivateKeyPassword = if ($OciPrivateKeyPassword) { $OciPrivateKeyPassword.Trim() } else { $null }
+$originalOciCliSuppressPermWarning = $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING
+$ociCliSuppressPermWarningOverridden = $false
+
+if ([string]::IsNullOrWhiteSpace($env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING)) {
+    $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING = "True"
+    $ociCliSuppressPermWarningOverridden = $true
+}
+
+function Convert-SecureStringToPlainText {
+    param(
+        [Parameter(Mandatory = $true)]
+        [SecureString]$SecureString
+    )
+
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
 
 function Invoke-ExternalCapture {
     param(
@@ -169,6 +212,7 @@ $currentStep = 0
 $summaryDone = $false
 
 $ociAvailable = $false
+$ociExecutable = ""
 $terraformAvailable = $false
 $sshPublicKey = ""
 $privateKeyHint = "<path-to-private-key>"
@@ -181,6 +225,20 @@ $publicIp = ""
 $privateIp = ""
 $instanceOcid = ""
 $sshCommand = ""
+$originalOciPrivateKeyPassword = $env:OCI_PRIVATE_KEY_PASSWORD
+$originalOciCliPassphrase = $env:OCI_CLI_PASSPHRASE
+$originalTfVarPrivateKeyPassword = $env:TF_VAR_private_key_password
+$ociPrivateKeyPasswordOverridden = $false
+$ociPrivateKeyPasswordSource = if (
+    [string]::IsNullOrWhiteSpace($originalOciPrivateKeyPassword) -and
+    [string]::IsNullOrWhiteSpace($originalOciCliPassphrase) -and
+    [string]::IsNullOrWhiteSpace($originalTfVarPrivateKeyPassword)
+) {
+    "not-set"
+}
+else {
+    "env"
+}
 
 function Start-Step {
     param([int]$Index)
@@ -213,6 +271,7 @@ try {
     $currentStep = 2
     Start-Step -Index $currentStep
     $validationIssues = @()
+    $validationWarnings = @()
 
     if (-not (Test-Path -Path $SshPublicKeyPath -PathType Leaf)) {
         $validationIssues += "SSH public key file not found: $SshPublicKeyPath"
@@ -227,25 +286,71 @@ try {
         }
     }
 
-    if ($TenancyOcid -notmatch "^(?i)ocid1\\.tenancy\\..+") {
+    if (-not $TenancyOcid.StartsWith("ocid1.tenancy.", [System.StringComparison]::OrdinalIgnoreCase)) {
         $validationIssues += "TenancyOcid is not a valid tenancy OCID."
     }
-    if ($CompartmentOcid -notmatch "^(?i)ocid1\\.(compartment|tenancy)\\..+") {
+    if (
+        -not $CompartmentOcid.StartsWith("ocid1.compartment.", [System.StringComparison]::OrdinalIgnoreCase) -and
+        -not $CompartmentOcid.StartsWith("ocid1.tenancy.", [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
         $validationIssues += "CompartmentOcid must be a compartment/root-tenancy OCID."
     }
+    if ($PromptOciPrivateKeyPassword -and -not [string]::IsNullOrWhiteSpace($OciPrivateKeyPassword)) {
+        $validationIssues += "Use only one of -PromptOciPrivateKeyPassword or -OciPrivateKeyPassword."
+    }
 
-    $ociAvailable = (Get-Command oci -ErrorAction SilentlyContinue) -ne $null
+    $ociExecutable = Resolve-OciExecutable -PreferredPath $OciCliPath
+    $ociAvailable = -not [string]::IsNullOrWhiteSpace($ociExecutable)
     $terraformAvailable = (Get-Command terraform -ErrorAction SilentlyContinue) -ne $null
-    if (-not $ociAvailable) { $validationIssues += "oci CLI not found on PATH." }
+    if (-not $ociAvailable) { $validationIssues += "oci CLI executable not found. Use -OciCliPath `"C:\Program Files (x86)\Oracle\oci_cli\oci.exe`"." }
     if (-not $terraformAvailable) { $validationIssues += "terraform not found on PATH." }
+
+    if ($validationIssues.Count -eq 0) {
+        if ($PromptOciPrivateKeyPassword) {
+            $securePassphrase = Read-Host "OCI API key passphrase (hidden)" -AsSecureString
+            $plainPassphrase = Convert-SecureStringToPlainText -SecureString $securePassphrase
+            if ([string]::IsNullOrWhiteSpace($plainPassphrase)) {
+                if (
+                    -not [string]::IsNullOrWhiteSpace($originalOciPrivateKeyPassword) -or
+                    -not [string]::IsNullOrWhiteSpace($originalOciCliPassphrase) -or
+                    -not [string]::IsNullOrWhiteSpace($originalTfVarPrivateKeyPassword)
+                ) {
+                    $ociPrivateKeyPasswordSource = "env"
+                }
+                else {
+                    $ociPrivateKeyPasswordSource = "none"
+                    $validationWarnings += "Prompted OCI API key passphrase was empty. Continuing without passphrase override."
+                }
+            }
+            else {
+                $env:OCI_PRIVATE_KEY_PASSWORD = $plainPassphrase
+                $env:OCI_CLI_PASSPHRASE = $plainPassphrase
+                $env:TF_VAR_private_key_password = $plainPassphrase
+                $ociPrivateKeyPasswordOverridden = $true
+                $ociPrivateKeyPasswordSource = "prompt"
+            }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($OciPrivateKeyPassword)) {
+            $env:OCI_PRIVATE_KEY_PASSWORD = $OciPrivateKeyPassword
+            $env:OCI_CLI_PASSPHRASE = $OciPrivateKeyPassword
+            $env:TF_VAR_private_key_password = $OciPrivateKeyPassword
+            $ociPrivateKeyPasswordOverridden = $true
+            $ociPrivateKeyPasswordSource = "parameter"
+        }
+    }
 
     if ($validationIssues.Count -gt 0) {
         $inputsValid = $false
         End-Step -Index $currentStep -Status "FAIL" -Details ($validationIssues -join " ")
     }
+    elseif ($validationWarnings.Count -gt 0) {
+        $inputsValid = $true
+        $details = "Inputs validated with warning. Profile=$Profile. OCI passphrase source=$ociPrivateKeyPasswordSource. $($validationWarnings -join ' ')"
+        End-Step -Index $currentStep -Status "WARN" -Details $details
+    }
     else {
         $inputsValid = $true
-        End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile."
+        End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile. OCI passphrase source=$ociPrivateKeyPasswordSource. OCI CLI=$ociExecutable"
     }
 
     $currentStep = 3
@@ -254,7 +359,7 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run auth indicator because oci CLI is missing."
     }
     else {
-        $nsResult = Invoke-ExternalCapture -File "oci" -Arguments @(
+        $nsResult = Invoke-ExternalCapture -File $ociExecutable -Arguments @(
             "os", "ns", "get",
             "--profile", $Profile,
             "--region", $Region,
@@ -280,7 +385,7 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot discover ADs because oci CLI is missing."
     }
     else {
-        $adResult = Invoke-ExternalCapture -File "oci" -Arguments @(
+        $adResult = Invoke-ExternalCapture -File $ociExecutable -Arguments @(
             "iam", "availability-domain", "list",
             "--compartment-id", $TenancyOcid,
             "--profile", $Profile,
@@ -577,6 +682,36 @@ catch {
 }
 finally {
     Finish-ProgressUi -Activity $activity
+    if ($ociPrivateKeyPasswordOverridden) {
+        if ([string]::IsNullOrWhiteSpace($originalOciPrivateKeyPassword)) {
+            Remove-Item Env:OCI_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:OCI_PRIVATE_KEY_PASSWORD = $originalOciPrivateKeyPassword
+        }
+
+        if ([string]::IsNullOrWhiteSpace($originalOciCliPassphrase)) {
+            Remove-Item Env:OCI_CLI_PASSPHRASE -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:OCI_CLI_PASSPHRASE = $originalOciCliPassphrase
+        }
+
+        if ([string]::IsNullOrWhiteSpace($originalTfVarPrivateKeyPassword)) {
+            Remove-Item Env:TF_VAR_private_key_password -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:TF_VAR_private_key_password = $originalTfVarPrivateKeyPassword
+        }
+    }
+    if ($ociCliSuppressPermWarningOverridden) {
+        if ([string]::IsNullOrWhiteSpace($originalOciCliSuppressPermWarning)) {
+            Remove-Item Env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING = $originalOciCliSuppressPermWarning
+        }
+    }
     Pop-Location
 }
 

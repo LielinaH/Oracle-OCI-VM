@@ -90,3 +90,50 @@ function Test-StepFailures {
 
     return @($Board | Where-Object { $_.Status -eq "FAIL" }).Count -gt 0
 }
+
+function Resolve-OciExecutable {
+    param(
+        [string]$PreferredPath
+    )
+
+    $candidates = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($PreferredPath)) {
+        $candidates += $PreferredPath
+    }
+
+    if ($env:ProgramFiles -and $env:ProgramFiles.Trim() -ne "") {
+        $candidates += (Join-Path $env:ProgramFiles "Oracle\oci_cli\oci.exe")
+    }
+    if (${env:ProgramFiles(x86)} -and ${env:ProgramFiles(x86)}.Trim() -ne "") {
+        $candidates += (Join-Path ${env:ProgramFiles(x86)} "Oracle\oci_cli\oci.exe")
+    }
+
+    foreach ($commandName in @("oci.exe", "oci")) {
+        $command = Get-Command $commandName -ErrorAction SilentlyContinue
+        if ($command -and $command.CommandType -eq "Application") {
+            $commandPath = if ($command.Path) { $command.Path } elseif ($command.Source) { $command.Source } else { "" }
+            if (-not [string]::IsNullOrWhiteSpace($commandPath)) {
+                $candidates += $commandPath
+            }
+        }
+    }
+
+    try {
+        $whereResults = @(where.exe oci.exe 2>$null)
+        if ($whereResults.Count -gt 0) {
+            $candidates += $whereResults
+        }
+    }
+    catch {
+        # Ignore where.exe failures.
+    }
+
+    foreach ($candidate in ($candidates | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique)) {
+        if (Test-Path -Path $candidate -PathType Leaf) {
+            return (Resolve-Path -Path $candidate).Path
+        }
+    }
+
+    return ""
+}

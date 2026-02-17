@@ -5,6 +5,7 @@ param(
 
     [string]$Region = "eu-frankfurt-1",
     [string]$Profile = "DEFAULT",
+    [string]$OciCliPath,
     [string]$AllowedSshCidr,
     [string]$EnforceRegion,
     [int]$Ocpus = 1,
@@ -14,6 +15,15 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_common.ps1"
+
+$OciCliPath = if ($OciCliPath) { $OciCliPath.Trim() } else { $null }
+$originalOciCliSuppressPermWarning = $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING
+$ociCliSuppressPermWarningOverridden = $false
+
+if ([string]::IsNullOrWhiteSpace($env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING)) {
+    $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING = "True"
+    $ociCliSuppressPermWarningOverridden = $true
+}
 
 function Invoke-ExternalCapture {
     param(
@@ -129,6 +139,7 @@ $currentStep = 0
 $summaryDone = $false
 $terraformAvailable = $false
 $ociAvailable = $false
+$ociExecutable = ""
 
 function Start-Step {
     param([int]$Index)
@@ -178,19 +189,19 @@ try {
 
     $currentStep = 3
     Start-Step -Index $currentStep
-    $ociCommand = Get-Command oci -ErrorAction SilentlyContinue
-    if ($ociCommand) {
+    $ociExecutable = Resolve-OciExecutable -PreferredPath $OciCliPath
+    if (-not [string]::IsNullOrWhiteSpace($ociExecutable)) {
         $ociAvailable = $true
-        $ociVersion = Invoke-ExternalCapture -File "oci" -Arguments @("-v")
+        $ociVersion = Invoke-ExternalCapture -File $ociExecutable -Arguments @("-v")
         if ($ociVersion.ExitCode -eq 0) {
-            End-Step -Index $currentStep -Status "PASS" -Details $ociVersion.Output.Trim()
+            End-Step -Index $currentStep -Status "PASS" -Details "$($ociVersion.Output.Trim()) ($ociExecutable)"
         }
         else {
             End-Step -Index $currentStep -Status "FAIL" -Details "oci -v failed: $($ociVersion.Output)"
         }
     }
     else {
-        End-Step -Index $currentStep -Status "FAIL" -Details "oci CLI not found on PATH."
+        End-Step -Index $currentStep -Status "FAIL" -Details "oci CLI executable not found. Use -OciCliPath `"C:\Program Files (x86)\Oracle\oci_cli\oci.exe`"."
     }
 
     $currentStep = 4
@@ -199,7 +210,7 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run auth indicator because oci CLI is missing."
     }
     else {
-        $nsResult = Invoke-ExternalCapture -File "oci" -Arguments @(
+        $nsResult = Invoke-ExternalCapture -File $ociExecutable -Arguments @(
             "os", "ns", "get",
             "--profile", $Profile,
             "--region", $Region,
@@ -239,7 +250,7 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot discover ADs because oci CLI is missing."
     }
     else {
-        $adResult = Invoke-ExternalCapture -File "oci" -Arguments @(
+        $adResult = Invoke-ExternalCapture -File $ociExecutable -Arguments @(
             "iam", "availability-domain", "list",
             "--compartment-id", $TenancyOcid,
             "--profile", $Profile,
@@ -304,7 +315,21 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform fmt -check because terraform is missing."
     }
     else {
-        $fmtResult = Invoke-ExternalCapture -File "terraform" -Arguments @("fmt", "-check", "-recursive")
+        $tfFiles = @(
+            Get-ChildItem -Path $projectRoot -Filter "*.tf" -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object { $_.FullName }
+        )
+        if ($tfFiles.Count -eq 0) {
+            $fmtResult = [pscustomobject]@{
+                ExitCode = 0
+                Output   = "No .tf files found."
+            }
+        }
+        else {
+            $fmtArgs = @("fmt", "-check", "-no-color") + $tfFiles
+            $fmtResult = Invoke-ExternalCapture -File "terraform" -Arguments $fmtArgs
+        }
         if ($fmtResult.ExitCode -eq 0) {
             End-Step -Index $currentStep -Status "PASS" -Details "terraform fmt -check succeeded."
         }
@@ -377,6 +402,14 @@ catch {
 }
 finally {
     Finish-ProgressUi -Activity $activity
+    if ($ociCliSuppressPermWarningOverridden) {
+        if ([string]::IsNullOrWhiteSpace($originalOciCliSuppressPermWarning)) {
+            Remove-Item Env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING = $originalOciCliSuppressPermWarning
+        }
+    }
     Pop-Location
 }
 
