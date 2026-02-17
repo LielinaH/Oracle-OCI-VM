@@ -25,6 +25,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_common.ps1"
 
+$TenancyOcid = $TenancyOcid.Trim()
+$CompartmentOcid = $CompartmentOcid.Trim()
+$Region = $Region.Trim()
+$Profile = $Profile.Trim()
+$NamePrefix = $NamePrefix.Trim()
+$AllowedSshCidr = if ($AllowedSshCidr) { $AllowedSshCidr.Trim() } else { $null }
+$EnforceRegion = if ($EnforceRegion) { $EnforceRegion.Trim() } else { $null }
+
 function Invoke-ExternalCapture {
     param(
         [Parameter(Mandatory = $true)]
@@ -165,6 +173,7 @@ $terraformAvailable = $false
 $sshPublicKey = ""
 $privateKeyHint = "<path-to-private-key>"
 $effectiveAllowedSshCidr = ""
+$inputsValid = $false
 $adOrder = @()
 $applySucceeded = $false
 $adUsed = ""
@@ -218,10 +227,10 @@ try {
         }
     }
 
-    if ($TenancyOcid -notmatch "^ocid1\\.tenancy\\..+") {
+    if ($TenancyOcid -notmatch "^(?i)ocid1\\.tenancy\\..+") {
         $validationIssues += "TenancyOcid is not a valid tenancy OCID."
     }
-    if (-not (($CompartmentOcid -match "^ocid1\\.compartment\\..+") -or ($CompartmentOcid -match "^ocid1\\.tenancy\\..+"))) {
+    if ($CompartmentOcid -notmatch "^(?i)ocid1\\.(compartment|tenancy)\\..+") {
         $validationIssues += "CompartmentOcid must be a compartment/root-tenancy OCID."
     }
 
@@ -231,9 +240,11 @@ try {
     if (-not $terraformAvailable) { $validationIssues += "terraform not found on PATH." }
 
     if ($validationIssues.Count -gt 0) {
+        $inputsValid = $false
         End-Step -Index $currentStep -Status "FAIL" -Details ($validationIssues -join " ")
     }
     else {
+        $inputsValid = $true
         End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile."
     }
 
@@ -262,7 +273,10 @@ try {
 
     $currentStep = 4
     Start-Step -Index $currentStep
-    if (-not $ociAvailable) {
+    if (-not $inputsValid) {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped due input validation failure."
+    }
+    elseif (-not $ociAvailable) {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot discover ADs because oci CLI is missing."
     }
     else {
@@ -336,7 +350,10 @@ try {
 
     $currentStep = 7
     Start-Step -Index $currentStep
-    if ([string]::IsNullOrWhiteSpace($sshPublicKey)) {
+    if (-not $inputsValid) {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped due input validation failure."
+    }
+    elseif ([string]::IsNullOrWhiteSpace($sshPublicKey)) {
         End-Step -Index $currentStep -Status "FAIL" -Details "ssh_public_key content is empty."
     }
     elseif ([string]::IsNullOrWhiteSpace($effectiveAllowedSshCidr)) {
@@ -355,7 +372,7 @@ try {
             "ocpus = $Ocpus",
             "memory_in_gbs = $MemoryInGbs"
         )
-        Set-Content -Path $tfvarsPath -Value ($tfvarsLines -join [Environment]::NewLine) -Encoding UTF8
+        Set-Content -Path $tfvarsPath -Value ($tfvarsLines -join [Environment]::NewLine) -Encoding utf8NoBOM
         End-Step -Index $currentStep -Status "PASS" -Details "Wrote terraform.auto.tfvars at $tfvarsPath"
     }
 
@@ -366,7 +383,21 @@ try {
     }
     else {
         $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
-        $fmtResult = Invoke-ExternalCapture -File "terraform" -Arguments @("fmt", "-check", "-recursive")
+        $tfFiles = @(
+            Get-ChildItem -Path $projectRoot -Filter "*.tf" -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object { $_.FullName }
+        )
+        if ($tfFiles.Count -eq 0) {
+            $fmtResult = [pscustomobject]@{
+                ExitCode = 0
+                Output   = "No .tf files found."
+            }
+        }
+        else {
+            $fmtArgs = @("fmt", "-check", "-no-color") + $tfFiles
+            $fmtResult = Invoke-ExternalCapture -File "terraform" -Arguments $fmtArgs
+        }
         $validateResult = Invoke-ExternalCapture -File "terraform" -Arguments @("validate", "-no-color")
 
         $details = "init=$($initResult.ExitCode), fmt=$($fmtResult.ExitCode), validate=$($validateResult.ExitCode)"
@@ -384,7 +415,13 @@ try {
 
     $currentStep = 9
     Start-Step -Index $currentStep
-    if (-not $terraformAvailable) {
+    if (-not $inputsValid) {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped due input validation failure."
+    }
+    elseif ($board[8 - 1].Status -eq "FAIL") {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because terraform init/fmt/validate failed."
+    }
+    elseif (-not $terraformAvailable) {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run apply because terraform is missing."
     }
     elseif ($adOrder.Count -lt 1) {

@@ -3,8 +3,8 @@ variable "compartment_ocid" {
   type        = string
 
   validation {
-    condition     = can(regex("^ocid1\\.compartment\\..+", var.compartment_ocid))
-    error_message = "compartment_ocid must be a valid OCI compartment OCID."
+    condition     = can(regex("^ocid1\\.(compartment|tenancy)\\..+", var.compartment_ocid))
+    error_message = "compartment_ocid must be a valid OCI compartment OCID (or root tenancy OCID)."
   }
 }
 
