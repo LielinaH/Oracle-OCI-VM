@@ -1,4 +1,3 @@
-#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -15,27 +14,16 @@ param(
     [string]$SshPublicKeyPath,
 
     [string]$AllowedSshCidr,
-    [int]$SshWaitTimeoutSeconds = 180
+    [int]$SshWaitTimeoutSeconds = 180,
+    [string]$EnforceRegion,
+    [switch]$Deterministic,
+    [int]$Ocpus = 1,
+    [int]$MemoryInGbs = 6
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_common.ps1"
-
-function Write-Indicator {
-    param(
-        [ValidateSet("PASS", "FAIL", "WARN", "INFO")]
-        [string]$Level,
-        [string]$Message
-    )
-
-    switch ($Level) {
-        "PASS" { Write-Host "[PASS] $Message" -ForegroundColor Green }
-        "FAIL" { Write-Host "[FAIL] $Message" -ForegroundColor Red }
-        "WARN" { Write-Host "[WARN] $Message" -ForegroundColor Yellow }
-        "INFO" { Write-Host "[INFO] $Message" -ForegroundColor Cyan }
-    }
-}
 
 function Invoke-ExternalCapture {
     param(
@@ -70,7 +58,7 @@ function Convert-OciRawList {
             return @($json | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ -ne "" })
         }
         catch {
-            # Fall back to line parsing.
+            # Fall through to text parsing.
         }
     }
 
@@ -110,61 +98,6 @@ function Test-Ipv4Cidr {
     return $true
 }
 
-function Get-HomeRegion {
-    param(
-        [string]$TenancyId,
-        [string]$RequestedRegion,
-        [string]$CliProfile
-    )
-
-    $query = 'data[?"is-home-region"]."region-name" | [0]'
-    $result = Invoke-ExternalCapture -File "oci" -Arguments @(
-        "iam", "region-subscription", "list",
-        "--tenancy-id", $TenancyId,
-        "--profile", $CliProfile,
-        "--region", $RequestedRegion,
-        "--query", $query,
-        "--raw-output",
-        "--all"
-    )
-    if ($result.ExitCode -ne 0) {
-        throw "Unable to determine tenancy home region. OCI output: $($result.Output)"
-    }
-
-    $homeRegion = $result.Output.Trim()
-    if ([string]::IsNullOrWhiteSpace($homeRegion) -or $homeRegion -eq "null") {
-        throw "Home region lookup returned empty output."
-    }
-    return $homeRegion
-}
-
-function Get-AvailabilityDomains {
-    param(
-        [string]$TenancyId,
-        [string]$RequestedRegion,
-        [string]$CliProfile
-    )
-
-    $result = Invoke-ExternalCapture -File "oci" -Arguments @(
-        "iam", "availability-domain", "list",
-        "--compartment-id", $TenancyId,
-        "--profile", $CliProfile,
-        "--region", $RequestedRegion,
-        "--query", "data[].name",
-        "--raw-output",
-        "--all"
-    )
-    if ($result.ExitCode -ne 0) {
-        throw "Unable to list availability domains. OCI output: $($result.Output)"
-    }
-
-    $ads = @(Convert-OciRawList -RawText $result.Output | Sort-Object -Unique)
-    if ($ads.Count -eq 0) {
-        throw "OCI returned zero availability domains."
-    }
-    return $ads
-}
-
 function Get-DetectedPublicIp {
     try {
         $ip = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 10).ToString().Trim()
@@ -175,6 +108,7 @@ function Get-DetectedPublicIp {
     catch {
         return $null
     }
+
     return $null
 }
 
@@ -190,170 +124,407 @@ function Get-TerraformOutputRaw {
     return $result.Output.Trim()
 }
 
+$steps = @(
+    "Preflight: PowerShell 7+",
+    "Validate inputs (TenancyOcid/CompartmentOcid/SshPublicKeyPath)",
+    "Auth indicator: oci os ns get",
+    "Discover ADs (dedupe; order randomized unless -Deterministic)",
+    "Region policy check (default/warn; enforce option)",
+    "Detect public IP (ipify) => allowed_ssh_cidr (WARN fallback 0.0.0.0/0)",
+    "Write terraform.auto.tfvars (non-secret values only)",
+    "terraform init + validate (init + fmt + validate) as indicators",
+    "Attempt apply with AD retry loop (show remaining attempts each try)",
+    "Outputs (OCID, AD used, public/private IP, SSH command)",
+    "SSH reachability test (Test-NetConnection port 22 with retries)",
+    "Summary indicators"
+)
+
+$activity = "apply-retry.ps1 progress"
+$board = New-StepBoard -StepNames $steps
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$exitCode = 1
+$currentStep = 0
+$summaryDone = $false
+
+$ociAvailable = $false
+$terraformAvailable = $false
+$sshPublicKey = ""
+$privateKeyHint = "<path-to-private-key>"
+$effectiveAllowedSshCidr = ""
+$adOrder = @()
+$applySucceeded = $false
+$adUsed = ""
+$publicIp = ""
+$privateIp = ""
+$instanceOcid = ""
+$sshCommand = ""
+
+function Start-Step {
+    param([int]$Index)
+    Set-StepStatus -Board $board -Index $Index -Status "RUNNING" -Details ""
+    Update-ProgressUi -Board $board -Activity $activity -CurrentIndex $Index -CurrentLabel $board[$Index - 1].Name
+}
+
+function End-Step {
+    param(
+        [int]$Index,
+        [ValidateSet("PASS", "WARN", "FAIL", "SKIP")]
+        [string]$Status,
+        [string]$Details
+    )
+    Set-StepStatus -Board $board -Index $Index -Status $Status -Details $Details
+    Show-StepBoard -Board $board -Title "apply-retry.ps1 step board"
+}
+
 Push-Location $projectRoot
 try {
-    Write-Indicator -Level "INFO" -Message "Starting apply with AD retry from $projectRoot"
-    Write-Indicator -Level "INFO" -Message "Using OCI profile '$Profile' from $HOME/.oci/config"
-    Write-Indicator -Level "INFO" -Message "Using SSH public key file '$SshPublicKeyPath'"
-
-    if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
-        throw "Terraform is not installed or not on PATH."
-    }
-    if (-not (Get-Command oci -ErrorAction SilentlyContinue)) {
-        throw "OCI CLI is not installed or not on PATH."
-    }
-
-    if (-not (Test-Path -Path $SshPublicKeyPath -PathType Leaf)) {
-        throw "SSH public key file not found: $SshPublicKeyPath"
-    }
-
-    $sshPublicKey = (Get-Content -Path $SshPublicKeyPath -Raw).Trim()
-    if ($sshPublicKey -notmatch "^ssh-") {
-        throw "SSH public key file must start with ssh-."
-    }
-    Write-Indicator -Level "PASS" -Message "SSH public key format looks valid."
-
-    $privateKeyHint = if ($SshPublicKeyPath.EndsWith(".pub")) {
-        $SshPublicKeyPath.Substring(0, $SshPublicKeyPath.Length - 4)
+    $currentStep = 1
+    Start-Step -Index $currentStep
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        End-Step -Index $currentStep -Status "PASS" -Details "PowerShell $($PSVersionTable.PSVersion) detected."
     }
     else {
-        "<path-to-private-key>"
+        End-Step -Index $currentStep -Status "FAIL" -Details "PowerShell 7+ required. Current: $($PSVersionTable.PSVersion)."
     }
 
-    $effectiveAllowedSshCidr = $AllowedSshCidr
-    if (-not $effectiveAllowedSshCidr) {
-        $publicIp = Get-DetectedPublicIp
-        if ($publicIp) {
-            $effectiveAllowedSshCidr = "$publicIp/32"
-            Write-Indicator -Level "PASS" -Message "Detected public IP $publicIp. Using allowed_ssh_cidr=$effectiveAllowedSshCidr"
+    $currentStep = 2
+    Start-Step -Index $currentStep
+    $validationIssues = @()
+
+    if (-not (Test-Path -Path $SshPublicKeyPath -PathType Leaf)) {
+        $validationIssues += "SSH public key file not found: $SshPublicKeyPath"
+    }
+    else {
+        $sshPublicKey = (Get-Content -Path $SshPublicKeyPath -Raw).Trim()
+        if ($sshPublicKey -notmatch "^ssh-") {
+            $validationIssues += "SSH public key must start with ssh-."
+        }
+        if ($SshPublicKeyPath.EndsWith(".pub")) {
+            $privateKeyHint = $SshPublicKeyPath.Substring(0, $SshPublicKeyPath.Length - 4)
+        }
+    }
+
+    if (-not (can(regex("^ocid1\\.tenancy\\..+", $TenancyOcid)))) {
+        $validationIssues += "TenancyOcid is not a valid tenancy OCID."
+    }
+    if (-not (can(regex("^ocid1\\.compartment\\..+", $CompartmentOcid)) -or (can(regex("^ocid1\\.tenancy\\..+", $CompartmentOcid))))) {
+        $validationIssues += "CompartmentOcid must be a compartment/root-tenancy OCID."
+    }
+
+    $ociAvailable = (Get-Command oci -ErrorAction SilentlyContinue) -ne $null
+    $terraformAvailable = (Get-Command terraform -ErrorAction SilentlyContinue) -ne $null
+    if (-not $ociAvailable) { $validationIssues += "oci CLI not found on PATH." }
+    if (-not $terraformAvailable) { $validationIssues += "terraform not found on PATH." }
+
+    if ($validationIssues.Count -gt 0) {
+        End-Step -Index $currentStep -Status "FAIL" -Details ($validationIssues -join " ")
+    }
+    else {
+        End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile."
+    }
+
+    $currentStep = 3
+    Start-Step -Index $currentStep
+    if (-not $ociAvailable) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run auth indicator because oci CLI is missing."
+    }
+    else {
+        $nsResult = Invoke-ExternalCapture -File "oci" -Arguments @(
+            "os", "ns", "get",
+            "--profile", $Profile,
+            "--region", $Region,
+            "--query", "data",
+            "--raw-output"
+        )
+        if ($nsResult.ExitCode -eq 0) {
+            End-Step -Index $currentStep -Status "PASS" -Details "Namespace: $($nsResult.Output.Trim())"
+        }
+        else {
+            End-Step -Index $currentStep -Status "FAIL" -Details "oci os ns get failed: $($nsResult.Output)"
+        }
+    }
+
+    $currentStep = 4
+    Start-Step -Index $currentStep
+    if (-not $ociAvailable) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "Cannot discover ADs because oci CLI is missing."
+    }
+    else {
+        $adResult = Invoke-ExternalCapture -File "oci" -Arguments @(
+            "iam", "availability-domain", "list",
+            "--compartment-id", $TenancyOcid,
+            "--profile", $Profile,
+            "--region", $Region,
+            "--query", "data[].name",
+            "--raw-output"
+        )
+        if ($adResult.ExitCode -ne 0) {
+            End-Step -Index $currentStep -Status "FAIL" -Details "AD discovery failed: $($adResult.Output)"
+        }
+        else {
+            $ads = @(Convert-OciRawList -RawText $adResult.Output | Sort-Object -Unique)
+            if ($ads.Count -lt 1) {
+                End-Step -Index $currentStep -Status "FAIL" -Details "AD discovery returned zero results."
+            }
+            else {
+                if ($Deterministic) {
+                    $adOrder = $ads
+                }
+                else {
+                    $adOrder = @(Get-Random -InputObject $ads -Count $ads.Count)
+                }
+                End-Step -Index $currentStep -Status "PASS" -Details "Order: $($adOrder -join ', ')"
+            }
+        }
+    }
+
+    $currentStep = 5
+    Start-Step -Index $currentStep
+    if ($EnforceRegion) {
+        if ($Region -eq $EnforceRegion) {
+            End-Step -Index $currentStep -Status "PASS" -Details "Region '$Region' matches -EnforceRegion '$EnforceRegion'."
+        }
+        else {
+            End-Step -Index $currentStep -Status "FAIL" -Details "Region '$Region' does not match -EnforceRegion '$EnforceRegion'."
+        }
+    }
+    elseif ($Region -eq "eu-frankfurt-1") {
+        End-Step -Index $currentStep -Status "PASS" -Details "Region '$Region' matches default recommendation."
+    }
+    else {
+        End-Step -Index $currentStep -Status "WARN" -Details "Region '$Region' differs from default 'eu-frankfurt-1'. Continuing."
+    }
+
+    $currentStep = 6
+    Start-Step -Index $currentStep
+    if ($AllowedSshCidr) {
+        if (Test-Ipv4Cidr -Value $AllowedSshCidr) {
+            $effectiveAllowedSshCidr = $AllowedSshCidr
+            End-Step -Index $currentStep -Status "PASS" -Details "Using caller-provided allowed_ssh_cidr=$effectiveAllowedSshCidr"
+        }
+        else {
+            End-Step -Index $currentStep -Status "FAIL" -Details "Invalid IPv4 CIDR: $AllowedSshCidr"
+        }
+    }
+    else {
+        $detectedIp = Get-DetectedPublicIp
+        if ($detectedIp) {
+            $effectiveAllowedSshCidr = "$detectedIp/32"
+            End-Step -Index $currentStep -Status "PASS" -Details "Detected $detectedIp. allowed_ssh_cidr=$effectiveAllowedSshCidr"
         }
         else {
             $effectiveAllowedSshCidr = "0.0.0.0/0"
-            Write-Indicator -Level "WARN" -Message "Could not detect public IP. Falling back to allowed_ssh_cidr=0.0.0.0/0"
+            End-Step -Index $currentStep -Status "WARN" -Details "ipify unavailable. Using fallback allowed_ssh_cidr=0.0.0.0/0"
         }
     }
+
+    $currentStep = 7
+    Start-Step -Index $currentStep
+    if ([string]::IsNullOrWhiteSpace($sshPublicKey)) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "ssh_public_key content is empty."
+    }
+    elseif ([string]::IsNullOrWhiteSpace($effectiveAllowedSshCidr)) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "effective allowed_ssh_cidr is empty."
+    }
     else {
-        Write-Indicator -Level "INFO" -Message "Using caller-provided allowed_ssh_cidr=$effectiveAllowedSshCidr"
-    }
-
-    if (-not (Test-Ipv4Cidr -Value $effectiveAllowedSshCidr)) {
-        throw "allowed_ssh_cidr is not a valid IPv4 CIDR: $effectiveAllowedSshCidr"
-    }
-
-    $homeRegion = Get-HomeRegion -TenancyId $TenancyOcid -RequestedRegion $Region -CliProfile $Profile
-    if ($homeRegion -ne $Region) {
-        throw "Requested region '$Region' is not tenancy home region '$homeRegion'."
-    }
-    if ($Region -ne "eu-frankfurt-1") {
-        throw "Project policy requires region eu-frankfurt-1."
-    }
-    Write-Indicator -Level "PASS" -Message "Home region guard passed: $Region"
-
-    $ads = @(Get-AvailabilityDomains -TenancyId $TenancyOcid -RequestedRegion $Region -CliProfile $Profile)
-    $adsRandomized = @(Get-Random -InputObject $ads -Count $ads.Count)
-    Write-Indicator -Level "INFO" -Message "AD candidates discovered: $($ads -join ', ')"
-    Write-Indicator -Level "INFO" -Message "AD retry order this run: $($adsRandomized -join ', ')"
-
-    $tfvarsPath = Join-Path $projectRoot "terraform.auto.tfvars"
-    $tfvarsLines = @(
-        "compartment_ocid = $(Convert-ToTerraformStringLiteral -Value $CompartmentOcid)",
-        "region = $(Convert-ToTerraformStringLiteral -Value $Region)",
-        "oci_profile = $(Convert-ToTerraformStringLiteral -Value $Profile)",
-        "name_prefix = $(Convert-ToTerraformStringLiteral -Value $NamePrefix)",
-        "ssh_public_key = $(Convert-ToTerraformStringLiteral -Value $sshPublicKey)",
-        "allowed_ssh_cidr = $(Convert-ToTerraformStringLiteral -Value $effectiveAllowedSshCidr)",
-        "ssh_private_key_path_hint = $(Convert-ToTerraformStringLiteral -Value $privateKeyHint)"
-    )
-    Set-Content -Path $tfvarsPath -Value ($tfvarsLines -join [Environment]::NewLine) -Encoding UTF8
-    Write-Indicator -Level "PASS" -Message "Wrote terraform.auto.tfvars with runtime inputs."
-
-    $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
-    if ($initResult.ExitCode -ne 0) {
-        throw "terraform init failed. Output:`n$($initResult.Output)"
-    }
-    Write-Indicator -Level "PASS" -Message "terraform init succeeded."
-
-    $successfulAd = $null
-    foreach ($ad in $adsRandomized) {
-        Write-Indicator -Level "INFO" -Message "Attempting terraform apply in AD '$ad'"
-        $applyResult = Invoke-ExternalCapture -File "terraform" -Arguments @(
-            "apply",
-            "-auto-approve",
-            "-input=false",
-            "-no-color",
-            "-var", "availability_domain=$ad"
+        $tfvarsPath = Join-Path $projectRoot "terraform.auto.tfvars"
+        $tfvarsLines = @(
+            "compartment_ocid = $(Convert-ToTerraformStringLiteral -Value $CompartmentOcid)",
+            "region = $(Convert-ToTerraformStringLiteral -Value $Region)",
+            "oci_profile = $(Convert-ToTerraformStringLiteral -Value $Profile)",
+            "name_prefix = $(Convert-ToTerraformStringLiteral -Value $NamePrefix)",
+            "ssh_public_key = $(Convert-ToTerraformStringLiteral -Value $sshPublicKey)",
+            "allowed_ssh_cidr = $(Convert-ToTerraformStringLiteral -Value $effectiveAllowedSshCidr)",
+            "ssh_private_key_path_hint = $(Convert-ToTerraformStringLiteral -Value $privateKeyHint)",
+            "ocpus = $Ocpus",
+            "memory_in_gbs = $MemoryInGbs"
         )
-
-        if ($applyResult.ExitCode -eq 0) {
-            $successfulAd = $ad
-            Write-Indicator -Level "PASS" -Message "Apply succeeded in AD '$ad'."
-            break
-        }
-
-        if ($applyResult.Output -match "(?i)Out of capacity for shape|Out of host capacity") {
-            Write-Indicator -Level "WARN" -Message "Capacity error in AD '$ad'. Trying next AD."
-            continue
-        }
-
-        throw "terraform apply failed with a non-capacity error in AD '$ad'. Output:`n$($applyResult.Output)"
+        Set-Content -Path $tfvarsPath -Value ($tfvarsLines -join [Environment]::NewLine) -Encoding UTF8
+        End-Step -Index $currentStep -Status "PASS" -Details "Wrote terraform.auto.tfvars at $tfvarsPath"
     }
 
-    if (-not $successfulAd) {
-        throw "All AD retries were exhausted due to capacity errors."
-    }
-
-    $instanceOcid = Get-TerraformOutputRaw -Name "instance_ocid"
-    $adUsed = Get-TerraformOutputRaw -Name "ad_used"
-    $publicIp = Get-TerraformOutputRaw -Name "public_ip"
-    $privateIp = Get-TerraformOutputRaw -Name "private_ip"
-    $sshCommand = Get-TerraformOutputRaw -Name "ssh_command_powershell"
-
-    Write-Host ""
-    Write-Indicator -Level "PASS" -Message "Terraform outputs:"
-    Write-Host "  instance_ocid          = $instanceOcid"
-    Write-Host "  ad_used                = $adUsed"
-    Write-Host "  public_ip              = $publicIp"
-    Write-Host "  private_ip             = $privateIp"
-    Write-Host "  ssh_command_powershell = $sshCommand"
-
-    if (-not $publicIp) {
-        Write-Indicator -Level "WARN" -Message "No public IP reported. Skipping SSH port reachability check."
-        exit 0
-    }
-
-    if (-not (Get-Command Test-NetConnection -ErrorAction SilentlyContinue)) {
-        Write-Indicator -Level "WARN" -Message "Test-NetConnection command not found. Skipping SSH port check."
-        exit 0
-    }
-
-    $deadline = (Get-Date).AddSeconds($SshWaitTimeoutSeconds)
-    $attempt = 0
-    $reachable = $false
-    while ((Get-Date) -lt $deadline) {
-        $attempt++
-        $tnc = Test-NetConnection -ComputerName $publicIp -Port 22 -WarningAction SilentlyContinue
-        if ($tnc.TcpTestSucceeded) {
-            $reachable = $true
-            break
-        }
-        Write-Indicator -Level "INFO" -Message "SSH port 22 not reachable yet (attempt $attempt). Retrying in 10s."
-        Start-Sleep -Seconds 10
-    }
-
-    if ($reachable) {
-        Write-Indicator -Level "PASS" -Message "SSH reachability check passed for $publicIp:22"
+    $currentStep = 8
+    Start-Step -Index $currentStep
+    if (-not $terraformAvailable) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform checks because terraform is missing."
     }
     else {
-        Write-Indicator -Level "WARN" -Message "SSH reachability check timed out after $SshWaitTimeoutSeconds seconds."
+        $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
+        $fmtResult = Invoke-ExternalCapture -File "terraform" -Arguments @("fmt", "-check", "-recursive")
+        $validateResult = Invoke-ExternalCapture -File "terraform" -Arguments @("validate", "-no-color")
+
+        $details = "init=$($initResult.ExitCode), fmt=$($fmtResult.ExitCode), validate=$($validateResult.ExitCode)"
+        if ($initResult.ExitCode -eq 0 -and $fmtResult.ExitCode -eq 0 -and $validateResult.ExitCode -eq 0) {
+            End-Step -Index $currentStep -Status "PASS" -Details $details
+        }
+        else {
+            $errorSummary = @()
+            if ($initResult.ExitCode -ne 0) { $errorSummary += "init failed: $($initResult.Output)" }
+            if ($fmtResult.ExitCode -ne 0) { $errorSummary += "fmt failed: $($fmtResult.Output)" }
+            if ($validateResult.ExitCode -ne 0) { $errorSummary += "validate failed: $($validateResult.Output)" }
+            End-Step -Index $currentStep -Status "FAIL" -Details (($details + " | " + ($errorSummary -join " ")) -replace "\s+", " ")
+        }
     }
 
-    exit 0
+    $currentStep = 9
+    Start-Step -Index $currentStep
+    if (-not $terraformAvailable) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run apply because terraform is missing."
+    }
+    elseif ($adOrder.Count -lt 1) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "No AD candidates available for apply attempts."
+    }
+    else {
+        $attemptTotal = $adOrder.Count
+        $attemptNumber = 0
+        foreach ($adName in $adOrder) {
+            $attemptNumber++
+            $remaining = $attemptTotal - $attemptNumber
+            $attemptLabel = "Attempt $attemptNumber/$attemptTotal, AD=$adName, Remaining=$remaining"
+
+            Set-StepStatus -Board $board -Index $currentStep -Status "RUNNING" -Details $attemptLabel
+            Update-ProgressUi -Board $board -Activity $activity -CurrentIndex $currentStep -CurrentLabel $attemptLabel
+            Show-StepBoard -Board $board -Title "apply-retry.ps1 step board"
+
+            $applyResult = Invoke-ExternalCapture -File "terraform" -Arguments @(
+                "apply",
+                "-auto-approve",
+                "-input=false",
+                "-no-color",
+                "-var", "availability_domain=$adName"
+            )
+
+            if ($applyResult.ExitCode -eq 0) {
+                $applySucceeded = $true
+                $adUsed = $adName
+                End-Step -Index $currentStep -Status "PASS" -Details "Success on $attemptLabel"
+                break
+            }
+
+            if ($applyResult.Output -match "(?i)Out of capacity for shape|Out of host capacity") {
+                continue
+            }
+
+            Write-Host ""
+            Write-Host "----- terraform apply non-capacity error output -----" -ForegroundColor Red
+            Write-Host $applyResult.Output
+            End-Step -Index $currentStep -Status "FAIL" -Details "Non-capacity error on $attemptLabel"
+            break
+        }
+
+        if (-not $applySucceeded -and $board[$currentStep - 1].Status -ne "FAIL") {
+            End-Step -Index $currentStep -Status "FAIL" -Details "All AD attempts exhausted due to capacity errors."
+        }
+    }
+
+    $currentStep = 10
+    Start-Step -Index $currentStep
+    if (-not $applySucceeded) {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because apply did not succeed."
+    }
+    else {
+        $instanceOcid = Get-TerraformOutputRaw -Name "instance_ocid"
+        if (-not $adUsed) {
+            $adUsed = Get-TerraformOutputRaw -Name "ad_used"
+        }
+        $publicIp = Get-TerraformOutputRaw -Name "public_ip"
+        $privateIp = Get-TerraformOutputRaw -Name "private_ip"
+        $sshCommand = Get-TerraformOutputRaw -Name "ssh_command_powershell"
+
+        Write-Host ""
+        Write-Host "Terraform outputs:" -ForegroundColor Green
+        Write-Host "  instance_ocid          = $instanceOcid"
+        Write-Host "  ad_used                = $adUsed"
+        Write-Host "  public_ip              = $publicIp"
+        Write-Host "  private_ip             = $privateIp"
+        Write-Host "  ssh_command_powershell = $sshCommand"
+
+        End-Step -Index $currentStep -Status "PASS" -Details "Outputs collected."
+    }
+
+    $currentStep = 11
+    Start-Step -Index $currentStep
+    if (-not $applySucceeded) {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because apply did not succeed."
+    }
+    elseif (-not $publicIp) {
+        End-Step -Index $currentStep -Status "WARN" -Details "No public IP found; skipped Test-NetConnection."
+    }
+    elseif (-not (Get-Command Test-NetConnection -ErrorAction SilentlyContinue)) {
+        End-Step -Index $currentStep -Status "WARN" -Details "Test-NetConnection not available; skipped SSH reachability test."
+    }
+    else {
+        $deadline = (Get-Date).AddSeconds($SshWaitTimeoutSeconds)
+        $checkAttempt = 0
+        $reachable = $false
+        while ((Get-Date) -lt $deadline) {
+            $checkAttempt++
+            $tnc = Test-NetConnection -ComputerName $publicIp -Port 22 -WarningAction SilentlyContinue
+            if ($tnc.TcpTestSucceeded) {
+                $reachable = $true
+                break
+            }
+            Start-Sleep -Seconds 10
+        }
+
+        if ($reachable) {
+            End-Step -Index $currentStep -Status "PASS" -Details "SSH port 22 reachable on $publicIp."
+        }
+        else {
+            End-Step -Index $currentStep -Status "WARN" -Details "SSH port 22 not reachable within $SshWaitTimeoutSeconds seconds."
+        }
+    }
+
+    $currentStep = 12
+    Start-Step -Index $currentStep
+    $summaryWarnings = @()
+    if ($Ocpus -gt 1 -or $MemoryInGbs -gt 6) {
+        $summaryWarnings += "Sizing warning: Ocpus=$Ocpus, MemoryInGbs=$MemoryInGbs (recommended 1/6)."
+    }
+
+    $hasFailure = Test-StepFailures -Board $board
+    $hasWarnings = ($board | Where-Object { $_.Status -eq "WARN" }).Count -gt 0
+
+    if ($hasFailure) {
+        $summaryText = "One or more steps failed."
+        if ($summaryWarnings.Count -gt 0) {
+            $summaryText = "$summaryText $($summaryWarnings -join ' ')"
+        }
+        End-Step -Index $currentStep -Status "FAIL" -Details $summaryText
+        $exitCode = 1
+    }
+    elseif ($hasWarnings -or $summaryWarnings.Count -gt 0) {
+        $summaryText = "Completed with warnings."
+        if ($summaryWarnings.Count -gt 0) {
+            $summaryText = "$summaryText $($summaryWarnings -join ' ')"
+        }
+        End-Step -Index $currentStep -Status "WARN" -Details $summaryText
+        $exitCode = 0
+    }
+    else {
+        End-Step -Index $currentStep -Status "PASS" -Details "Completed successfully."
+        $exitCode = 0
+    }
+
+    $summaryDone = $true
 }
 catch {
-    Write-Indicator -Level "FAIL" -Message $_.Exception.Message
-    exit 1
+    $errorMessage = $_.Exception.Message
+    if ($currentStep -ge 1 -and $currentStep -le $board.Count -and $board[$currentStep - 1].Status -eq "RUNNING") {
+        Set-StepStatus -Board $board -Index $currentStep -Status "FAIL" -Details $errorMessage
+        Show-StepBoard -Board $board -Title "apply-retry.ps1 step board"
+    }
+
+    if (-not $summaryDone) {
+        Set-StepStatus -Board $board -Index 12 -Status "FAIL" -Details "Unhandled error: $errorMessage"
+        Show-StepBoard -Board $board -Title "apply-retry.ps1 step board"
+    }
+
+    $exitCode = 1
 }
 finally {
+    Finish-ProgressUi -Activity $activity
     Pop-Location
 }
+
+exit $exitCode

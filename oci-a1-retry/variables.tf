@@ -9,14 +9,9 @@ variable "compartment_ocid" {
 }
 
 variable "region" {
-  description = "OCI region for deployment. This project is intentionally locked to the tenancy home region for Always Free safety."
+  description = "OCI region for deployment."
   type        = string
   default     = "eu-frankfurt-1"
-
-  validation {
-    condition     = var.region == "eu-frankfurt-1"
-    error_message = "This project is restricted to eu-frankfurt-1 to avoid non-free-region deployments."
-  }
 }
 
 variable "oci_profile" {
@@ -63,8 +58,8 @@ variable "ocpus" {
   default     = 1
 
   validation {
-    condition     = var.ocpus >= 1 && var.ocpus <= 4 && floor(var.ocpus) == var.ocpus
-    error_message = "ocpus must be an integer between 1 and 4."
+    condition     = var.ocpus >= 1 && floor(var.ocpus) == var.ocpus
+    error_message = "ocpus must be an integer greater than or equal to 1."
   }
 }
 
@@ -74,8 +69,8 @@ variable "memory_in_gbs" {
   default     = 6
 
   validation {
-    condition     = var.memory_in_gbs >= 1 && var.memory_in_gbs <= 24 && floor(var.memory_in_gbs) == var.memory_in_gbs
-    error_message = "memory_in_gbs must be an integer between 1 and 24."
+    condition     = var.memory_in_gbs >= 6 && floor(var.memory_in_gbs) == var.memory_in_gbs
+    error_message = "memory_in_gbs must be an integer greater than or equal to 6."
   }
 }
 

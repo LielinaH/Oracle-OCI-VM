@@ -1,4 +1,3 @@
-#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [string]$Region = "eu-frankfurt-1",
@@ -9,21 +8,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_common.ps1"
-
-function Write-Indicator {
-    param(
-        [ValidateSet("PASS", "FAIL", "WARN", "INFO")]
-        [string]$Level,
-        [string]$Message
-    )
-
-    switch ($Level) {
-        "PASS" { Write-Host "[PASS] $Message" -ForegroundColor Green }
-        "FAIL" { Write-Host "[FAIL] $Message" -ForegroundColor Red }
-        "WARN" { Write-Host "[WARN] $Message" -ForegroundColor Yellow }
-        "INFO" { Write-Host "[INFO] $Message" -ForegroundColor Cyan }
-    }
-}
 
 function Invoke-ExternalCapture {
     param(
@@ -42,44 +26,119 @@ function Invoke-ExternalCapture {
     }
 }
 
+$steps = @(
+    "Preflight: PowerShell 7+",
+    "terraform init",
+    "terraform destroy",
+    "Summary indicators"
+)
+
+$activity = "destroy.ps1 progress"
+$board = New-StepBoard -StepNames $steps
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$exitCode = 1
+$currentStep = 0
+$summaryDone = $false
+
+function Start-Step {
+    param([int]$Index)
+    Set-StepStatus -Board $board -Index $Index -Status "RUNNING" -Details ""
+    Update-ProgressUi -Board $board -Activity $activity -CurrentIndex $Index -CurrentLabel $board[$Index - 1].Name
+}
+
+function End-Step {
+    param(
+        [int]$Index,
+        [ValidateSet("PASS", "WARN", "FAIL", "SKIP")]
+        [string]$Status,
+        [string]$Details
+    )
+    Set-StepStatus -Board $board -Index $Index -Status $Status -Details $Details
+    Show-StepBoard -Board $board -Title "destroy.ps1 step board"
+}
+
 Push-Location $projectRoot
 try {
-    Write-Indicator -Level "INFO" -Message "Starting terraform destroy from $projectRoot"
+    $currentStep = 1
+    Start-Step -Index $currentStep
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        End-Step -Index $currentStep -Status "PASS" -Details "PowerShell $($PSVersionTable.PSVersion) detected."
+    }
+    else {
+        End-Step -Index $currentStep -Status "FAIL" -Details "PowerShell 7+ required. Current: $($PSVersionTable.PSVersion)."
+    }
 
+    $currentStep = 2
+    Start-Step -Index $currentStep
     if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
-        throw "Terraform is not installed or not on PATH."
+        End-Step -Index $currentStep -Status "FAIL" -Details "terraform not found on PATH."
+    }
+    else {
+        $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
+        if ($initResult.ExitCode -eq 0) {
+            End-Step -Index $currentStep -Status "PASS" -Details "terraform init succeeded."
+        }
+        else {
+            End-Step -Index $currentStep -Status "FAIL" -Details "terraform init failed: $($initResult.Output)"
+        }
     }
 
-    $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
-    if ($initResult.ExitCode -ne 0) {
-        throw "terraform init failed. Output:`n$($initResult.Output)"
+    $currentStep = 3
+    Start-Step -Index $currentStep
+    if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "terraform not found on PATH."
     }
-    Write-Indicator -Level "PASS" -Message "terraform init succeeded."
+    else {
+        $destroyArgs = @(
+            "destroy",
+            "-input=false",
+            "-no-color",
+            "-var", "region=$Region",
+            "-var", "oci_profile=$Profile"
+        )
+        if ($AutoApprove) {
+            $destroyArgs += "-auto-approve"
+        }
 
-    $destroyArgs = @(
-        "destroy",
-        "-input=false",
-        "-no-color",
-        "-var", "region=$Region",
-        "-var", "oci_profile=$Profile"
-    )
-    if ($AutoApprove) {
-        $destroyArgs += "-auto-approve"
+        $destroyResult = Invoke-ExternalCapture -File "terraform" -Arguments $destroyArgs
+        if ($destroyResult.ExitCode -eq 0) {
+            End-Step -Index $currentStep -Status "PASS" -Details "terraform destroy completed."
+        }
+        else {
+            End-Step -Index $currentStep -Status "FAIL" -Details "terraform destroy failed: $($destroyResult.Output)"
+        }
     }
 
-    $destroyResult = Invoke-ExternalCapture -File "terraform" -Arguments $destroyArgs
-    if ($destroyResult.ExitCode -ne 0) {
-        throw "terraform destroy failed. Output:`n$($destroyResult.Output)"
+    $currentStep = 4
+    Start-Step -Index $currentStep
+    if (Test-StepFailures -Board $board) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "One or more steps failed."
+        $exitCode = 1
+    }
+    else {
+        End-Step -Index $currentStep -Status "PASS" -Details "Destroy flow completed."
+        $exitCode = 0
     }
 
-    Write-Indicator -Level "PASS" -Message "Destroy completed."
-    exit 0
+    $summaryDone = $true
 }
 catch {
-    Write-Indicator -Level "FAIL" -Message $_.Exception.Message
-    exit 1
+    $errorMessage = $_.Exception.Message
+    if ($currentStep -ge 1 -and $currentStep -le $board.Count -and $board[$currentStep - 1].Status -eq "RUNNING") {
+        Set-StepStatus -Board $board -Index $currentStep -Status "FAIL" -Details $errorMessage
+        Show-StepBoard -Board $board -Title "destroy.ps1 step board"
+    }
+
+    if (-not $summaryDone) {
+        Set-StepStatus -Board $board -Index 4 -Status "FAIL" -Details "Unhandled error: $errorMessage"
+        Show-StepBoard -Board $board -Title "destroy.ps1 step board"
+    }
+
+    $exitCode = 1
 }
 finally {
+    Finish-ProgressUi -Activity $activity
     Pop-Location
 }
+
+exit $exitCode

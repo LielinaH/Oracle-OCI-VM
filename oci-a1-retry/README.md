@@ -1,28 +1,23 @@
 # OCI A1 Retry (Always Free) - Terraform + PowerShell
 
-Provision one OCI Always Free ARM instance (`VM.Standard.A1.Flex`) with Ubuntu 24.04 and automatic retry across Availability Domains when OCI reports host/shape capacity exhaustion.
-
-This project is intentionally strict for safety:
-- Region policy locked to `eu-frankfurt-1` (Germany Central, Frankfurt).
-- Shape policy locked to `VM.Standard.A1.Flex`.
-- Image policy locked to Ubuntu 24.04 unless you explicitly set `image_ocid_override`.
+Provision one OCI instance on `VM.Standard.A1.Flex` using Ubuntu 24.04, with automatic retry across Availability Domains when OCI returns host/shape capacity errors.
 
 ## Prerequisites
-- Windows with PowerShell 7+ (`pwsh`).
-- Terraform CLI (`>= 1.6`).
-- OCI CLI (`oci`) configured with API-key auth.
-- Existing SSH keypair (public key file required by apply script).
+- Windows with PowerShell 7+ (`pwsh`)
+- Terraform CLI (`>= 1.6`)
+- OCI CLI (`oci`) configured with API-key auth
+- Existing SSH key pair (public key path required)
 
 ## OCI API Key Auth Setup (High-Level)
 1. In OCI Console, create an API key for your user and upload the public key.
 2. Store the private API key locally (for example `%USERPROFILE%\.oci\oci_api_key.pem`).
-3. Configure `%USERPROFILE%\.oci\config` with a profile (default: `DEFAULT`) containing:
+3. Configure `%USERPROFILE%\.oci\config` with a profile (default `DEFAULT`) containing:
 - `user`
 - `fingerprint`
 - `tenancy`
 - `region`
 - `key_file`
-4. Validate from terminal:
+4. Validate auth:
 ```powershell
 oci -v
 oci os ns get --profile DEFAULT --region eu-frankfurt-1
@@ -30,32 +25,60 @@ oci os ns get --profile DEFAULT --region eu-frankfurt-1
 
 ## Operator Input Map
 - OCI API auth profile:
-  `%USERPROFILE%\.oci\config` -> use via `-Profile` (default `DEFAULT`)
+  `%USERPROFILE%\.oci\config` via `-Profile` (default `DEFAULT`)
 - Tenancy OCID:
-  pass to scripts as `-TenancyOcid`
+  `-TenancyOcid`
 - Compartment OCID:
-  pass to apply script as `-CompartmentOcid`
+  `-CompartmentOcid`
 - SSH public key path:
-  pass to apply script as `-SshPublicKeyPath` (example `%USERPROFILE%\.ssh\id_ed25519.pub`)
-- SSH key passphrase:
-  handled by your local SSH client/agent at connect time; never stored in this repo
+  `-SshPublicKeyPath` (for example `%USERPROFILE%\.ssh\id_ed25519.pub`)
+- SSH passphrase:
+  handled by your local SSH client/agent; never stored in repo
 - SSH ingress CIDR:
-  optional `-AllowedSshCidr`; otherwise scripts auto-detect your public IP and use `/32`
+  optional `-AllowedSshCidr`; otherwise auto-detected via ipify and `/32`
+
+## Progress Indicators
+All scripts use:
+- `Write-Progress` live progress bar
+- a step-board table after each step with: `Index | Name | Status | Details`
+
+Step statuses:
+- `PENDING`: not started yet
+- `RUNNING`: current step
+- `PASS`: completed successfully
+- `WARN`: completed with warning, execution continues
+- `FAIL`: failed; final exit code is non-zero
+- `SKIP`: not run because a prior requirement failed
+
+## Region Policy
+- Default region remains `eu-frankfurt-1`.
+- Home-region discovery is **not** used by these scripts.
+- Without `-EnforceRegion`:
+- `eu-frankfurt-1` => `PASS`
+- any other region => `WARN` and continue
+- With `-EnforceRegion <region>`:
+- mismatch => `FAIL`
+- match => `PASS`
 
 ## Quick Start
-Run commands from `oci-a1-retry/`.
+Run from the `oci-a1-retry` project root.
 
-### 1) Preflight
+### 1) Doctor / Preflight
 ```powershell
-pwsh ./scripts/doctor.ps1 `
+pwsh .\scripts\doctor.ps1 `
   -TenancyOcid "ocid1.tenancy.oc1..exampleuniqueID" `
   -Region "eu-frankfurt-1" `
   -Profile "DEFAULT"
 ```
 
-### 2) Apply with AD Retry
+Optional strict region enforcement:
 ```powershell
-pwsh ./scripts/apply-retry.ps1 `
+-EnforceRegion "eu-frankfurt-1"
+```
+
+### 2) Apply With AD Retry
+```powershell
+pwsh .\scripts\apply-retry.ps1 `
   -TenancyOcid "ocid1.tenancy.oc1..exampleuniqueID" `
   -CompartmentOcid "ocid1.compartment.oc1..exampleuniqueID" `
   -Region "eu-frankfurt-1" `
@@ -64,58 +87,54 @@ pwsh ./scripts/apply-retry.ps1 `
   -SshPublicKeyPath "$env:USERPROFILE\.ssh\id_ed25519.pub"
 ```
 
-Optional override:
+Optional flags:
 ```powershell
 -AllowedSshCidr "203.0.113.10/32"
+-EnforceRegion "eu-frankfurt-1"
+-Deterministic
+-Ocpus 1
+-MemoryInGbs 6
 ```
 
 ### 3) SSH
-The apply script prints `ssh_command_powershell` output. Typical form:
+Use the printed `ssh_command_powershell` output, for example:
 ```powershell
 ssh -i "$env:USERPROFILE\.ssh\id_ed25519" ubuntu@<public_ip>
 ```
 
 ### 4) Destroy
 ```powershell
-pwsh ./scripts/destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoApprove $true
+pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoApprove $true
 ```
 
-## Optional Image Pinning
-If latest Ubuntu 24.04 selection fails or you want deterministic rebuilds, set `image_ocid_override` in `terraform.auto.tfvars` or pass via Terraform CLI when applying manually.
+## Image Selection
+- Terraform selects image data with:
+- `operating_system = "Canonical Ubuntu"`
+- `operating_system_version = "24.04"`
+- `shape = var.shape` (`VM.Standard.A1.Flex`) for compatibility gating
+- If no match is found and no override is set, Terraform fails with:
+  `Set image_ocid_override to a known-good ARM Ubuntu 24.04 image OCID for this region.`
 
 ## Troubleshooting
 
 ### "Out of capacity for shape" / "Out of host capacity"
-- `apply-retry.ps1` detects these errors and retries automatically across all discovered ADs.
-- AD names are discovered via OCI CLI, de-duplicated, and randomized each run.
-- If every AD returns capacity errors, the script exits with a clear failure.
+- Apply retries across discovered ADs.
+- With default behavior, AD order is randomized each run.
+- Use `-Deterministic` for stable sorted AD order.
 
-### No public IP or SSH not reachable
-- Confirm subnet route table has `0.0.0.0/0 -> Internet Gateway`.
-- Confirm security list allows TCP/22 from your effective `allowed_ssh_cidr`.
-- Confirm `assign_public_ip=true` in Terraform variables.
-- Wait a bit longer and retry SSH check (cloud-init may still be initializing).
+### Region mismatch behavior
+- By default, non-`eu-frankfurt-1` regions produce `WARN` and continue.
+- With `-EnforceRegion`, mismatch produces `FAIL`.
+
+### No public IP / SSH not reachable
+- Verify route table has `0.0.0.0/0 -> Internet Gateway`.
+- Verify security list allows TCP/22 from effective `allowed_ssh_cidr`.
+- Verify `assign_public_ip=true`.
 
 ### Image selection issues
-- By default, Terraform queries the latest Ubuntu 24.04 image compatible with `VM.Standard.A1.Flex`.
-- If no image is returned in your compartment context, set `image_ocid_override` to a known valid image OCID.
-
-### Region guard fails
-- This project intentionally enforces `eu-frankfurt-1` and checks tenancy home region for Always Free safety.
+- Set `image_ocid_override` to a known-good Ubuntu 24.04 ARM image OCID for your region.
 
 ## State and Safety Notes
 - Local Terraform state is used by default.
-- For team/shared usage, migrate to a remote backend before collaborative operations.
-- This repo never stores OCI private API keys or SSH private keys.
-- Generated `terraform.auto.tfvars`, `.terraform/`, and state files are git-ignored.
-
-## Expected Indicators
-- `[PASS] Terraform and OCI CLI detected`
-- `[PASS] OCI auth namespace check succeeded`
-- `[PASS] Home region check passed for eu-frankfurt-1`
-- `[PASS] AD discovery returned at least one AD`
-- `[PASS] terraform fmt -check and validate succeeded`
-- `[PASS] Apply succeeded in one AD after retry logic`
-- `[PASS] Outputs include OCID, AD, public/private IP, SSH command`
-- `[PASS] SSH port 22 reachable` (or a warning with guidance)
-- `[PASS] Destroy completed`
+- `.terraform/`, state files, and `terraform.auto.tfvars` are git-ignored.
+- Never store OCI private API keys or SSH private keys in repo.
