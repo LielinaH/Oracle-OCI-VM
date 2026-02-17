@@ -6,6 +6,7 @@ param(
     [string]$Region = "eu-frankfurt-1",
     [string]$Profile = "DEFAULT",
     [string]$OciCliPath,
+    [string]$TerraformPath,
     [string]$AllowedSshCidr,
     [string]$EnforceRegion,
     [int]$Ocpus = 1,
@@ -17,6 +18,7 @@ $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\_common.ps1"
 
 $OciCliPath = if ($OciCliPath) { $OciCliPath.Trim() } else { $null }
+$TerraformPath = if ($TerraformPath) { $TerraformPath.Trim() } else { $null }
 $originalOciCliSuppressPermWarning = $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING
 $ociCliSuppressPermWarningOverridden = $false
 
@@ -138,6 +140,7 @@ $exitCode = 1
 $currentStep = 0
 $summaryDone = $false
 $terraformAvailable = $false
+$terraformExecutable = ""
 $ociAvailable = $false
 $ociExecutable = ""
 
@@ -171,20 +174,20 @@ try {
 
     $currentStep = 2
     Start-Step -Index $currentStep
-    $terraformCommand = Get-Command terraform -ErrorAction SilentlyContinue
-    if ($terraformCommand) {
+    $terraformExecutable = Resolve-TerraformExecutable -PreferredPath $TerraformPath
+    if (-not [string]::IsNullOrWhiteSpace($terraformExecutable)) {
         $terraformAvailable = $true
-        $tfVersion = Invoke-ExternalCapture -File "terraform" -Arguments @("version")
+        $tfVersion = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("version")
         if ($tfVersion.ExitCode -eq 0) {
             $firstLine = ($tfVersion.Output -split "\r?\n")[0]
-            End-Step -Index $currentStep -Status "PASS" -Details $firstLine
+            End-Step -Index $currentStep -Status "PASS" -Details "$firstLine ($terraformExecutable)"
         }
         else {
             End-Step -Index $currentStep -Status "FAIL" -Details "terraform version failed: $($tfVersion.Output)"
         }
     }
     else {
-        End-Step -Index $currentStep -Status "FAIL" -Details "terraform not found on PATH."
+        End-Step -Index $currentStep -Status "FAIL" -Details "terraform executable not found. Use -TerraformPath `"C:\Users\<you>\AppData\Local\Microsoft\WinGet\Links\terraform.exe`"."
     }
 
     $currentStep = 3
@@ -246,7 +249,10 @@ try {
 
     $currentStep = 6
     Start-Step -Index $currentStep
-    if (-not $ociAvailable) {
+    if ($board[4 - 1].Status -eq "FAIL") {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because auth indicator failed."
+    }
+    elseif (-not $ociAvailable) {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot discover ADs because oci CLI is missing."
     }
     else {
@@ -300,7 +306,7 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform init because terraform is missing."
     }
     else {
-        $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
+        $initResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("init", "-input=false", "-no-color")
         if ($initResult.ExitCode -eq 0) {
             End-Step -Index $currentStep -Status "PASS" -Details "terraform init succeeded."
         }
@@ -328,7 +334,7 @@ try {
         }
         else {
             $fmtArgs = @("fmt", "-check", "-no-color") + $tfFiles
-            $fmtResult = Invoke-ExternalCapture -File "terraform" -Arguments $fmtArgs
+            $fmtResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments $fmtArgs
         }
         if ($fmtResult.ExitCode -eq 0) {
             End-Step -Index $currentStep -Status "PASS" -Details "terraform fmt -check succeeded."
@@ -344,7 +350,7 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform validate because terraform is missing."
     }
     else {
-        $validateResult = Invoke-ExternalCapture -File "terraform" -Arguments @("validate", "-no-color")
+        $validateResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("validate", "-no-color")
         if ($validateResult.ExitCode -eq 0) {
             End-Step -Index $currentStep -Status "PASS" -Details "terraform validate succeeded."
         }

@@ -75,6 +75,7 @@ Optional strict region enforcement:
 ```powershell
 -EnforceRegion "eu-frankfurt-1"
 -OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"
+-TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"
 ```
 
 ### 2) Apply With AD Retry
@@ -94,6 +95,7 @@ Optional flags:
 -EnforceRegion "eu-frankfurt-1"
 -Deterministic
 -OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"
+-TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"
 -PromptOciPrivateKeyPassword
 # less preferred: -OciPrivateKeyPassword "<passphrase>"
 -Ocpus 1
@@ -133,6 +135,11 @@ pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoAppr
 ### OCI CLI command resolution issues
 - If you see `Get-Acl`/module-load errors while running `oci` from script, force the executable:
   `-OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"`
+- The scripts also set `OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True` during execution to avoid Windows ACL-check failures.
+
+### Terraform command resolution issues
+- If `terraform` is installed but scripts say it is missing, set:
+  `-TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"`
 
 ### No public IP / SSH not reachable
 - Verify route table has `0.0.0.0/0 -> Internet Gateway`.

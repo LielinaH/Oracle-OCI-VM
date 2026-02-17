@@ -137,3 +137,52 @@ function Resolve-OciExecutable {
 
     return ""
 }
+
+function Resolve-TerraformExecutable {
+    param(
+        [string]$PreferredPath
+    )
+
+    $candidates = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($PreferredPath)) {
+        $candidates += $PreferredPath
+    }
+
+    if ($env:LOCALAPPDATA -and $env:LOCALAPPDATA.Trim() -ne "") {
+        $candidates += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\terraform.exe")
+    }
+
+    if ($env:ProgramFiles -and $env:ProgramFiles.Trim() -ne "") {
+        $candidates += (Join-Path $env:ProgramFiles "HashiCorp\Terraform\terraform.exe")
+        $candidates += (Join-Path $env:ProgramFiles "Terraform\terraform.exe")
+    }
+
+    foreach ($commandName in @("terraform.exe", "terraform")) {
+        $command = Get-Command $commandName -ErrorAction SilentlyContinue
+        if ($command -and $command.CommandType -eq "Application") {
+            $commandPath = if ($command.Path) { $command.Path } elseif ($command.Source) { $command.Source } else { "" }
+            if (-not [string]::IsNullOrWhiteSpace($commandPath)) {
+                $candidates += $commandPath
+            }
+        }
+    }
+
+    try {
+        $whereResults = @(where.exe terraform.exe 2>$null)
+        if ($whereResults.Count -gt 0) {
+            $candidates += $whereResults
+        }
+    }
+    catch {
+        # Ignore where.exe failures.
+    }
+
+    foreach ($candidate in ($candidates | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" } | Select-Object -Unique)) {
+        if (Test-Path -Path $candidate -PathType Leaf) {
+            return (Resolve-Path -Path $candidate).Path
+        }
+    }
+
+    return ""
+}

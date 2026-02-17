@@ -18,6 +18,7 @@ param(
     [string]$EnforceRegion,
     [switch]$Deterministic,
     [string]$OciCliPath,
+    [string]$TerraformPath,
     [string]$OciPrivateKeyPassword,
     [switch]$PromptOciPrivateKeyPassword,
     [int]$Ocpus = 1,
@@ -52,6 +53,7 @@ $NamePrefix = $NamePrefix.Trim()
 $AllowedSshCidr = if ($AllowedSshCidr) { $AllowedSshCidr.Trim() } else { $null }
 $EnforceRegion = if ($EnforceRegion) { $EnforceRegion.Trim() } else { $null }
 $OciCliPath = if ($OciCliPath) { $OciCliPath.Trim() } else { $null }
+$TerraformPath = if ($TerraformPath) { $TerraformPath.Trim() } else { $null }
 $OciPrivateKeyPassword = if ($OciPrivateKeyPassword) { $OciPrivateKeyPassword.Trim() } else { $null }
 $originalOciCliSuppressPermWarning = $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING
 $ociCliSuppressPermWarningOverridden = $false
@@ -179,10 +181,11 @@ function Get-DetectedPublicIp {
 
 function Get-TerraformOutputRaw {
     param(
-        [string]$Name
+        [string]$Name,
+        [string]$Executable
     )
 
-    $result = Invoke-ExternalCapture -File "terraform" -Arguments @("output", "-raw", $Name)
+    $result = Invoke-ExternalCapture -File $Executable -Arguments @("output", "-raw", $Name)
     if ($result.ExitCode -ne 0) {
         return ""
     }
@@ -214,6 +217,7 @@ $summaryDone = $false
 $ociAvailable = $false
 $ociExecutable = ""
 $terraformAvailable = $false
+$terraformExecutable = ""
 $sshPublicKey = ""
 $privateKeyHint = "<path-to-private-key>"
 $effectiveAllowedSshCidr = ""
@@ -301,9 +305,10 @@ try {
 
     $ociExecutable = Resolve-OciExecutable -PreferredPath $OciCliPath
     $ociAvailable = -not [string]::IsNullOrWhiteSpace($ociExecutable)
-    $terraformAvailable = (Get-Command terraform -ErrorAction SilentlyContinue) -ne $null
+    $terraformExecutable = Resolve-TerraformExecutable -PreferredPath $TerraformPath
+    $terraformAvailable = -not [string]::IsNullOrWhiteSpace($terraformExecutable)
     if (-not $ociAvailable) { $validationIssues += "oci CLI executable not found. Use -OciCliPath `"C:\Program Files (x86)\Oracle\oci_cli\oci.exe`"." }
-    if (-not $terraformAvailable) { $validationIssues += "terraform not found on PATH." }
+    if (-not $terraformAvailable) { $validationIssues += "terraform executable not found. Use -TerraformPath `"C:\Users\<you>\AppData\Local\Microsoft\WinGet\Links\terraform.exe`"." }
 
     if ($validationIssues.Count -eq 0) {
         if ($PromptOciPrivateKeyPassword) {
@@ -350,7 +355,7 @@ try {
     }
     else {
         $inputsValid = $true
-        End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile. OCI passphrase source=$ociPrivateKeyPasswordSource. OCI CLI=$ociExecutable"
+        End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile. OCI passphrase source=$ociPrivateKeyPasswordSource. OCI CLI=$ociExecutable. Terraform=$terraformExecutable"
     }
 
     $currentStep = 3
@@ -380,6 +385,9 @@ try {
     Start-Step -Index $currentStep
     if (-not $inputsValid) {
         End-Step -Index $currentStep -Status "SKIP" -Details "Skipped due input validation failure."
+    }
+    elseif ($board[3 - 1].Status -eq "FAIL") {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because auth indicator failed."
     }
     elseif (-not $ociAvailable) {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot discover ADs because oci CLI is missing."
@@ -487,7 +495,7 @@ try {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform checks because terraform is missing."
     }
     else {
-        $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
+        $initResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("init", "-input=false", "-no-color")
         $tfFiles = @(
             Get-ChildItem -Path $projectRoot -Filter "*.tf" -File -Recurse |
             Sort-Object FullName |
@@ -501,9 +509,9 @@ try {
         }
         else {
             $fmtArgs = @("fmt", "-check", "-no-color") + $tfFiles
-            $fmtResult = Invoke-ExternalCapture -File "terraform" -Arguments $fmtArgs
+            $fmtResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments $fmtArgs
         }
-        $validateResult = Invoke-ExternalCapture -File "terraform" -Arguments @("validate", "-no-color")
+        $validateResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("validate", "-no-color")
 
         $details = "init=$($initResult.ExitCode), fmt=$($fmtResult.ExitCode), validate=$($validateResult.ExitCode)"
         if ($initResult.ExitCode -eq 0 -and $fmtResult.ExitCode -eq 0 -and $validateResult.ExitCode -eq 0) {
@@ -522,6 +530,9 @@ try {
     Start-Step -Index $currentStep
     if (-not $inputsValid) {
         End-Step -Index $currentStep -Status "SKIP" -Details "Skipped due input validation failure."
+    }
+    elseif ($board[4 - 1].Status -in @("FAIL", "SKIP")) {
+        End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because AD discovery did not succeed."
     }
     elseif ($board[8 - 1].Status -eq "FAIL") {
         End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because terraform init/fmt/validate failed."
@@ -544,7 +555,7 @@ try {
             Update-ProgressUi -Board $board -Activity $activity -CurrentIndex $currentStep -CurrentLabel $attemptLabel
             Show-StepBoard -Board $board -Title "apply-retry.ps1 step board"
 
-            $applyResult = Invoke-ExternalCapture -File "terraform" -Arguments @(
+            $applyResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @(
                 "apply",
                 "-auto-approve",
                 "-input=false",
@@ -581,13 +592,13 @@ try {
         End-Step -Index $currentStep -Status "SKIP" -Details "Skipped because apply did not succeed."
     }
     else {
-        $instanceOcid = Get-TerraformOutputRaw -Name "instance_ocid"
+        $instanceOcid = Get-TerraformOutputRaw -Name "instance_ocid" -Executable $terraformExecutable
         if (-not $adUsed) {
-            $adUsed = Get-TerraformOutputRaw -Name "ad_used"
+            $adUsed = Get-TerraformOutputRaw -Name "ad_used" -Executable $terraformExecutable
         }
-        $publicIp = Get-TerraformOutputRaw -Name "public_ip"
-        $privateIp = Get-TerraformOutputRaw -Name "private_ip"
-        $sshCommand = Get-TerraformOutputRaw -Name "ssh_command_powershell"
+        $publicIp = Get-TerraformOutputRaw -Name "public_ip" -Executable $terraformExecutable
+        $privateIp = Get-TerraformOutputRaw -Name "private_ip" -Executable $terraformExecutable
+        $sshCommand = Get-TerraformOutputRaw -Name "ssh_command_powershell" -Executable $terraformExecutable
 
         Write-Host ""
         Write-Host "Terraform outputs:" -ForegroundColor Green
