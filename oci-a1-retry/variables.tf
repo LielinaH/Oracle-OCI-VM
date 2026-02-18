@@ -42,13 +42,24 @@ variable "availability_domain" {
 }
 
 variable "shape" {
-  description = "OCI compute shape. Kept strict for Always Free ARM policy."
+  description = "OCI compute shape."
   type        = string
   default     = "VM.Standard.A1.Flex"
 
   validation {
-    condition     = var.shape == "VM.Standard.A1.Flex"
-    error_message = "shape must be VM.Standard.A1.Flex in this project."
+    condition     = can(regex("^VM\\..+", var.shape))
+    error_message = "shape must look like a valid OCI VM shape (for example, VM.Standard.A1.Flex)."
+  }
+}
+
+variable "allow_paid_shape" {
+  description = "Safety switch. Must be true when using non-Always-Free shapes."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = var.shape == "VM.Standard.A1.Flex" || var.allow_paid_shape
+    error_message = "Paid/non-A1 shapes require allow_paid_shape=true."
   }
 }
 

@@ -12,6 +12,12 @@ param(
     [string]$Region = "eu-frankfurt-1",
     [string]$Profile = "DEFAULT",
     [string]$NamePrefix = "oci-a1-retry",
+    [string]$Shape = "VM.Standard.A1.Flex",
+    [switch]$AllowPaidShape,
+    [int]$Ocpus = 1,
+    [int]$MemoryInGbs = 6,
+    [string]$ImageOperatingSystem = "Canonical Ubuntu",
+    [string]$ImageOperatingSystemVersion = "24.04",
     [int]$MinDelaySeconds = 45,
     [int]$MaxDelaySeconds = 180,
     [int]$MaxRounds = 0
@@ -39,7 +45,13 @@ try {
             -Region $Region `
             -Profile $Profile `
             -NamePrefix $NamePrefix `
-            -SshPublicKeyPath $SshPublicKeyPath
+            -SshPublicKeyPath $SshPublicKeyPath `
+            -Shape $Shape `
+            -Ocpus $Ocpus `
+            -MemoryInGbs $MemoryInGbs `
+            -ImageOperatingSystem $ImageOperatingSystem `
+            -ImageOperatingSystemVersion $ImageOperatingSystemVersion `
+            -AllowPaidShape:$AllowPaidShape
 
         $exitCode = $LASTEXITCODE
         if ($exitCode -eq 0) {

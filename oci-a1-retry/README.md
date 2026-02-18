@@ -103,6 +103,24 @@ Optional flags:
 # less preferred: -OciPrivateKeyPassword "<passphrase>"
 -Ocpus 1
 -MemoryInGbs 6
+-Shape "VM.Standard.A1.Flex"
+-AllowPaidShape
+-ImageOperatingSystem "Canonical Ubuntu"
+-ImageOperatingSystemVersion "24.04"
+```
+
+Paid validation example (explicitly allows billable shape):
+```powershell
+pwsh .\scripts\apply-retry.ps1 `
+  -TenancyOcid "ocid1.tenancy.oc1..exampleuniqueID" `
+  -CompartmentOcid "ocid1.compartment.oc1..exampleuniqueID" `
+  -Region "eu-frankfurt-1" `
+  -Profile "DEFAULT" `
+  -SshPublicKeyPath "$env:USERPROFILE\.ssh\id_ed25519.pub" `
+  -Shape "VM.Standard.E4.Flex" `
+  -Ocpus 1 `
+  -MemoryInGbs 8 `
+  -AllowPaidShape
 ```
 
 ### 3) SSH
@@ -111,6 +129,10 @@ Use the printed `ssh_command_powershell` output, for example:
 ssh -i "$env:USERPROFILE\.ssh\id_ed25519" ubuntu@<public_ip>
 ```
 
+After a successful apply, a run report is written to:
+- `reports/instance-<timestamp>.md` (archived per success)
+- `last-instance-details.md` (latest success, overwritten each time)
+
 ### 4) Destroy
 ```powershell
 pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoApprove $true
@@ -118,11 +140,11 @@ pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoAppr
 
 ## Image Selection
 - Terraform selects image data with:
-- `operating_system = "Canonical Ubuntu"`
-- `operating_system_version = "24.04"`
-- `shape = var.shape` (`VM.Standard.A1.Flex`) for compatibility gating
+- `operating_system = var.image_operating_system`
+- `operating_system_version = var.image_operating_system_version`
+- `shape = var.shape` for compatibility gating
 - If no match is found and no override is set, Terraform fails with:
-  `Set image_ocid_override to a known-good ARM Ubuntu 24.04 image OCID for this region.`
+  `No compatible image found for selected shape/OS filters. Set image_ocid_override or adjust image_operating_system/image_operating_system_version.`
 
 ## Troubleshooting
 
@@ -160,7 +182,7 @@ pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoAppr
 - Verify `assign_public_ip=true`.
 
 ### Image selection issues
-- Set `image_ocid_override` to a known-good Ubuntu 24.04 ARM image OCID for your region.
+- Set `image_ocid_override` to a known-good image OCID for your region/shape.
 
 ## State and Safety Notes
 - Local Terraform state is used by default.

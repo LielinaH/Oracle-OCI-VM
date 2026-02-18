@@ -25,7 +25,11 @@ param(
     [string]$OciPrivateKeyPassword,
     [switch]$PromptOciPrivateKeyPassword,
     [int]$Ocpus = 1,
-    [int]$MemoryInGbs = 6
+    [int]$MemoryInGbs = 6,
+    [string]$Shape = "VM.Standard.A1.Flex",
+    [switch]$AllowPaidShape,
+    [string]$ImageOperatingSystem = "Canonical Ubuntu",
+    [string]$ImageOperatingSystemVersion = "24.04"
 )
 
 Set-StrictMode -Version Latest
@@ -58,6 +62,9 @@ $EnforceRegion = if ($EnforceRegion) { $EnforceRegion.Trim() } else { $null }
 $OciCliPath = if ($OciCliPath) { $OciCliPath.Trim() } else { $null }
 $TerraformPath = if ($TerraformPath) { $TerraformPath.Trim() } else { $null }
 $OciPrivateKeyPassword = if ($OciPrivateKeyPassword) { $OciPrivateKeyPassword.Trim() } else { $null }
+$Shape = if ($Shape) { $Shape.Trim() } else { "" }
+$ImageOperatingSystem = if ($ImageOperatingSystem) { $ImageOperatingSystem.Trim() } else { "" }
+$ImageOperatingSystemVersion = if ($ImageOperatingSystemVersion) { $ImageOperatingSystemVersion.Trim() } else { "" }
 $originalOciCliSuppressPermWarning = $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING
 $ociCliSuppressPermWarningOverridden = $false
 
@@ -214,6 +221,20 @@ function Get-TerraformOutputRaw {
     return $result.Output.Trim()
 }
 
+function Convert-ToMarkdownCell {
+    param(
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    $text = [string]$Value
+    $text = $text.Replace("`r", " ").Replace("`n", " ")
+    return $text.Replace("|", "\|")
+}
+
 $steps = @(
     "Preflight: PowerShell 7+",
     "Validate inputs (TenancyOcid/CompartmentOcid/SshPublicKeyPath)",
@@ -237,6 +258,9 @@ $lockHeld = $false
 $exitCode = 1
 $currentStep = 0
 $summaryDone = $false
+$runStartedUtc = [DateTime]::UtcNow
+$runReportPath = ""
+$latestRunReportPath = Join-Path $projectRoot "last-instance-details.md"
 
 $ociAvailable = $false
 $ociExecutable = ""
@@ -333,6 +357,31 @@ try {
     }
     if ($PromptOciPrivateKeyPassword -and -not [string]::IsNullOrWhiteSpace($OciPrivateKeyPassword)) {
         $validationIssues += "Use only one of -PromptOciPrivateKeyPassword or -OciPrivateKeyPassword."
+    }
+    if ([string]::IsNullOrWhiteSpace($Shape)) {
+        $validationIssues += "Shape cannot be empty."
+    }
+    $isAlwaysFreeShape = $Shape.Equals("VM.Standard.A1.Flex", [System.StringComparison]::OrdinalIgnoreCase)
+    if (-not $isAlwaysFreeShape -and -not $AllowPaidShape) {
+        $validationIssues += "Safety stop: non-Always-Free shape '$Shape' requires -AllowPaidShape."
+    }
+    elseif (-not $isAlwaysFreeShape -and $AllowPaidShape) {
+        $validationWarnings += "Paid shape mode enabled for '$Shape'. OCI charges may apply."
+    }
+    if ($Ocpus -lt 1) {
+        $validationIssues += "Ocpus must be >= 1."
+    }
+    if ($MemoryInGbs -lt 1) {
+        $validationIssues += "MemoryInGbs must be >= 1."
+    }
+    if ($isAlwaysFreeShape -and ($Ocpus -gt 4 -or $MemoryInGbs -gt 24)) {
+        $validationWarnings += "Always Free A1 recommended limits are up to 4 OCPUs and 24 GB memory total."
+    }
+    if ([string]::IsNullOrWhiteSpace($ImageOperatingSystem)) {
+        $validationIssues += "ImageOperatingSystem cannot be empty."
+    }
+    if ([string]::IsNullOrWhiteSpace($ImageOperatingSystemVersion)) {
+        $validationIssues += "ImageOperatingSystemVersion cannot be empty."
     }
 
     $ociExecutable = Resolve-OciExecutable -PreferredPath $OciCliPath
@@ -467,12 +516,12 @@ try {
     }
     elseif ($validationWarnings.Count -gt 0) {
         $inputsValid = $true
-        $details = "Inputs validated with warning. Profile=$Profile. OCI passphrase source=$ociPrivateKeyPasswordSource. $($validationWarnings -join ' ')"
+        $details = "Inputs validated with warning. Profile=$Profile. Shape=$Shape. Ocpus=$Ocpus. MemoryInGbs=$MemoryInGbs. Image=$ImageOperatingSystem $ImageOperatingSystemVersion. OCI passphrase source=$ociPrivateKeyPasswordSource. $($validationWarnings -join ' ')"
         End-Step -Index $currentStep -Status "WARN" -Details $details
     }
     else {
         $inputsValid = $true
-        End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile. OCI passphrase source=$ociPrivateKeyPasswordSource. OCI CLI=$ociExecutable. Terraform=$terraformExecutable"
+        End-Step -Index $currentStep -Status "PASS" -Details "Inputs validated. Profile=$Profile. Shape=$Shape. Ocpus=$Ocpus. MemoryInGbs=$MemoryInGbs. Image=$ImageOperatingSystem $ImageOperatingSystemVersion. OCI passphrase source=$ociPrivateKeyPasswordSource. OCI CLI=$ociExecutable. Terraform=$terraformExecutable"
     }
 
     $currentStep = 3
@@ -591,14 +640,19 @@ try {
     }
     else {
         $tfvarsPath = Join-Path $projectRoot "terraform.auto.tfvars"
+        $allowPaidShapeLiteral = if ($AllowPaidShape) { "true" } else { "false" }
         $tfvarsLines = @(
             "compartment_ocid = $(Convert-ToTerraformStringLiteral -Value $CompartmentOcid)",
             "region = $(Convert-ToTerraformStringLiteral -Value $Region)",
             "oci_profile = $(Convert-ToTerraformStringLiteral -Value $Profile)",
             "name_prefix = $(Convert-ToTerraformStringLiteral -Value $NamePrefix)",
+            "shape = $(Convert-ToTerraformStringLiteral -Value $Shape)",
+            "allow_paid_shape = $allowPaidShapeLiteral",
             "ssh_public_key = $(Convert-ToTerraformStringLiteral -Value $sshPublicKey)",
             "allowed_ssh_cidr = $(Convert-ToTerraformStringLiteral -Value $effectiveAllowedSshCidr)",
             "ssh_private_key_path_hint = $(Convert-ToTerraformStringLiteral -Value $privateKeyHint)",
+            "image_operating_system = $(Convert-ToTerraformStringLiteral -Value $ImageOperatingSystem)",
+            "image_operating_system_version = $(Convert-ToTerraformStringLiteral -Value $ImageOperatingSystemVersion)",
             "ocpus = $Ocpus",
             "memory_in_gbs = $MemoryInGbs"
         )
@@ -687,7 +741,10 @@ try {
                 break
             }
 
-            if ($applyResult.Output -match "(?i)Out of capacity for shape|Out of host capacity") {
+            $isCapacityError = $applyResult.Output -match "(?i)Out of capacity for shape|Out of host capacity"
+            $isRetryableVnicPreparationError = $applyResult.Output -match "(?i)A problem occurred while preparing the instance's VNIC"
+
+            if ($isCapacityError -or $isRetryableVnicPreparationError) {
                 continue
             }
 
@@ -699,7 +756,7 @@ try {
         }
 
         if (-not $applySucceeded -and $board[$currentStep - 1].Status -ne "FAIL") {
-            End-Step -Index $currentStep -Status "FAIL" -Details "All AD attempts exhausted due to capacity errors."
+            End-Step -Index $currentStep -Status "FAIL" -Details "All AD attempts exhausted due to retryable launch errors (capacity and/or transient VNIC provisioning errors)."
         }
     }
 
@@ -764,6 +821,9 @@ try {
     $currentStep = 12
     Start-Step -Index $currentStep
     $summaryWarnings = @()
+    if (-not $Shape.Equals("VM.Standard.A1.Flex", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $summaryWarnings += "Paid shape warning: Shape=$Shape (charges may apply)."
+    }
     if ($Ocpus -gt 1 -or $MemoryInGbs -gt 6) {
         $summaryWarnings += "Sizing warning: Ocpus=$Ocpus, MemoryInGbs=$MemoryInGbs (recommended 1/6)."
     }
@@ -771,27 +831,89 @@ try {
     $hasFailure = Test-StepFailures -Board $board
     $hasWarnings = @($board | Where-Object { $_.Status -eq "WARN" }).Count -gt 0
 
+    $summaryStatus = "PASS"
+    $summaryText = ""
     if ($hasFailure) {
+        $summaryStatus = "FAIL"
         $summaryText = "One or more steps failed."
         if ($summaryWarnings.Count -gt 0) {
             $summaryText = "$summaryText $($summaryWarnings -join ' ')"
         }
-        End-Step -Index $currentStep -Status "FAIL" -Details $summaryText
         $exitCode = 1
     }
     elseif ($hasWarnings -or $summaryWarnings.Count -gt 0) {
+        $summaryStatus = "WARN"
         $summaryText = "Completed with warnings."
         if ($summaryWarnings.Count -gt 0) {
             $summaryText = "$summaryText $($summaryWarnings -join ' ')"
         }
-        End-Step -Index $currentStep -Status "WARN" -Details $summaryText
         $exitCode = 0
     }
     else {
-        End-Step -Index $currentStep -Status "PASS" -Details "Completed successfully."
+        $summaryStatus = "PASS"
+        $summaryText = "Completed successfully."
         $exitCode = 0
     }
 
+    if ($applySucceeded) {
+        $runEndedUtc = [DateTime]::UtcNow
+        $reportDirectory = Join-Path $projectRoot "reports"
+        if (-not (Test-Path -Path $reportDirectory -PathType Container)) {
+            New-Item -ItemType Directory -Path $reportDirectory -Force | Out-Null
+        }
+
+        $reportStamp = $runEndedUtc.ToString("yyyyMMdd-HHmmss")
+        $runReportPath = Join-Path $reportDirectory "instance-$reportStamp.md"
+
+        $reportLines = @(
+            "# OCI Apply Run Report",
+            "",
+            "- Started (UTC): $($runStartedUtc.ToString('u'))",
+            "- Ended (UTC): $($runEndedUtc.ToString('u'))",
+            "- Summary status: $summaryStatus",
+            "- Summary: $summaryText",
+            "",
+            "## Deployment",
+            "- Compartment: $CompartmentOcid",
+            "- Region: $Region",
+            "- Profile: $Profile",
+            "- Name Prefix: $NamePrefix",
+            "- Shape: $Shape",
+            "- OCPUs: $Ocpus",
+            "- Memory (GB): $MemoryInGbs",
+            "- Image: $ImageOperatingSystem $ImageOperatingSystemVersion",
+            "",
+            "## Instance",
+            "- OCID: $instanceOcid",
+            "- AD used: $adUsed",
+            "- Public IP: $publicIp",
+            "- Private IP: $privateIp",
+            "",
+            "## SSH",
+            "- Command (PowerShell):",
+            "```powershell",
+            "$sshCommand",
+            "```",
+            "",
+            "## Step Board",
+            "| Index | Name | Status | Details |",
+            "| --- | --- | --- | --- |"
+        )
+
+        foreach ($step in $board) {
+            $cellName = Convert-ToMarkdownCell -Value $step.Name
+            $cellStatus = Convert-ToMarkdownCell -Value $step.Status
+            $cellDetails = Convert-ToMarkdownCell -Value $step.Details
+            $reportLines += "| $($step.Index) | $cellName | $cellStatus | $cellDetails |"
+        }
+
+        Set-Content -Path $runReportPath -Value ($reportLines -join [Environment]::NewLine) -Encoding utf8NoBOM
+        Set-Content -Path $latestRunReportPath -Value ($reportLines -join [Environment]::NewLine) -Encoding utf8NoBOM
+        Write-Host "Run report written: $runReportPath" -ForegroundColor Cyan
+        $summaryText = "$summaryText Run report: $runReportPath"
+    }
+
+    End-Step -Index $currentStep -Status $summaryStatus -Details $summaryText
     $summaryDone = $true
 }
 catch {
