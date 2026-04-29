@@ -135,7 +135,27 @@ After a successful apply, a run report is written to:
 
 ### 4) Destroy
 ```powershell
-pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoApprove $true
+pwsh .\scripts\destroy.ps1 `
+  -Region "eu-frankfurt-1" `
+  -Profile "DEFAULT" `
+  -AutoApprove $true
+```
+
+Optional executable override:
+```powershell
+-TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"
+```
+
+### 5) Retry Loop
+Use this only after `doctor.ps1` passes and you intentionally want repeated apply rounds until capacity is available.
+
+```powershell
+pwsh .\scripts\run-loop.ps1 `
+  -TenancyOcid "ocid1.tenancy.oc1..exampleuniqueID" `
+  -CompartmentOcid "ocid1.compartment.oc1..exampleuniqueID" `
+  -Region "eu-frankfurt-1" `
+  -Profile "DEFAULT" `
+  -SshPublicKeyPath "$env:USERPROFILE\.ssh\id_ed25519.pub"
 ```
 
 ## Image Selection
@@ -186,5 +206,5 @@ pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoAppr
 
 ## State and Safety Notes
 - Local Terraform state is used by default.
-- `.terraform/`, state files, and `terraform.auto.tfvars` are git-ignored.
+- `.terraform/`, state files, generated reports, retry logs, lock files, and `terraform.auto.tfvars` are git-ignored.
 - Never store OCI private API keys or SSH private keys in repo.

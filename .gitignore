@@ -1,0 +1,31 @@
+# Local agent and workspace notes
+AGENTS.md
+
+# Local secret staging
+Oci vms/
+*.key
+*.pem
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Terraform working directories and state
+**/.terraform/
+**/.terraform.tfstate.lock.info
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/*.tfplan.*
+**/terraform.auto.tfvars
+**/*.tfvars
+**/*.tfvars.json
+!**/terraform.tfvars.example
+
+# Runtime artifacts
+**/.apply-retry.lock
+**/crash.log
+**/crash.*.log
+**/last-instance-details.md
+**/reports/
+**/run-loop-*.log

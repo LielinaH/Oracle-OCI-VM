@@ -12,6 +12,16 @@ param(
     [string]$Region = "eu-frankfurt-1",
     [string]$Profile = "DEFAULT",
     [string]$NamePrefix = "oci-a1-retry",
+    [string]$AllowedSshCidr,
+    [string]$EnforceRegion,
+    [switch]$Deterministic,
+    [string]$OciCliPath,
+    [string]$TerraformPath,
+    [switch]$AllowRootCompartment,
+    [switch]$AllowExistingNamedResources,
+    [switch]$ForceTakeLock,
+    [string]$OciPrivateKeyPassword,
+    [switch]$PromptOciPrivateKeyPassword,
     [string]$Shape = "VM.Standard.A1.Flex",
     [switch]$AllowPaidShape,
     [int]$Ocpus = 1,
@@ -39,19 +49,56 @@ try {
         $startedUtc = [DateTime]::UtcNow.ToString("u")
         Write-Host "[$startedUtc] Round $round started." -ForegroundColor Cyan
 
-        & pwsh .\scripts\apply-retry.ps1 `
-            -TenancyOcid $TenancyOcid `
-            -CompartmentOcid $CompartmentOcid `
-            -Region $Region `
-            -Profile $Profile `
-            -NamePrefix $NamePrefix `
-            -SshPublicKeyPath $SshPublicKeyPath `
-            -Shape $Shape `
-            -Ocpus $Ocpus `
-            -MemoryInGbs $MemoryInGbs `
-            -ImageOperatingSystem $ImageOperatingSystem `
-            -ImageOperatingSystemVersion $ImageOperatingSystemVersion `
-            -AllowPaidShape:$AllowPaidShape
+        $applyArgs = @(
+            ".\scripts\apply-retry.ps1",
+            "-TenancyOcid", $TenancyOcid,
+            "-CompartmentOcid", $CompartmentOcid,
+            "-Region", $Region,
+            "-Profile", $Profile,
+            "-NamePrefix", $NamePrefix,
+            "-SshPublicKeyPath", $SshPublicKeyPath,
+            "-Shape", $Shape,
+            "-Ocpus", $Ocpus,
+            "-MemoryInGbs", $MemoryInGbs,
+            "-ImageOperatingSystem", $ImageOperatingSystem,
+            "-ImageOperatingSystemVersion", $ImageOperatingSystemVersion
+        )
+
+        if (-not [string]::IsNullOrWhiteSpace($AllowedSshCidr)) {
+            $applyArgs += @("-AllowedSshCidr", $AllowedSshCidr)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($EnforceRegion)) {
+            $applyArgs += @("-EnforceRegion", $EnforceRegion)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($OciCliPath)) {
+            $applyArgs += @("-OciCliPath", $OciCliPath)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($TerraformPath)) {
+            $applyArgs += @("-TerraformPath", $TerraformPath)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($OciPrivateKeyPassword)) {
+            $applyArgs += @("-OciPrivateKeyPassword", $OciPrivateKeyPassword)
+        }
+        if ($Deterministic) {
+            $applyArgs += "-Deterministic"
+        }
+        if ($AllowRootCompartment) {
+            $applyArgs += "-AllowRootCompartment"
+        }
+        if ($AllowExistingNamedResources) {
+            $applyArgs += "-AllowExistingNamedResources"
+        }
+        if ($ForceTakeLock) {
+            $applyArgs += "-ForceTakeLock"
+        }
+        if ($PromptOciPrivateKeyPassword) {
+            $applyArgs += "-PromptOciPrivateKeyPassword"
+        }
+        if ($AllowPaidShape) {
+            $applyArgs += "-AllowPaidShape"
+        }
+
+        & pwsh @applyArgs
 
         $exitCode = $LASTEXITCODE
         if ($exitCode -eq 0) {

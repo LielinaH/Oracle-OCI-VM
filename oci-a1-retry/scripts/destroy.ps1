@@ -2,6 +2,7 @@
 param(
     [string]$Region = "eu-frankfurt-1",
     [string]$Profile = "DEFAULT",
+    [string]$TerraformPath,
     [bool]$AutoApprove = $true
 )
 
@@ -28,6 +29,7 @@ function Invoke-ExternalCapture {
 
 $steps = @(
     "Preflight: PowerShell 7+",
+    "Resolve terraform executable",
     "terraform init",
     "terraform destroy",
     "Summary indicators"
@@ -39,6 +41,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $exitCode = 1
 $currentStep = 0
 $summaryDone = $false
+$terraformExecutable = ""
 
 function Start-Step {
     param([int]$Index)
@@ -70,11 +73,28 @@ try {
 
     $currentStep = 2
     Start-Step -Index $currentStep
-    if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
-        End-Step -Index $currentStep -Status "FAIL" -Details "terraform not found on PATH."
+    $terraformExecutable = Resolve-TerraformExecutable -PreferredPath $TerraformPath
+    if ([string]::IsNullOrWhiteSpace($terraformExecutable)) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "terraform executable not found. Use -TerraformPath `\"C:\Users\<you>\AppData\Local\Microsoft\WinGet\Links\terraform.exe`\"."
     }
     else {
-        $initResult = Invoke-ExternalCapture -File "terraform" -Arguments @("init", "-input=false", "-no-color")
+        $versionResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("version")
+        if ($versionResult.ExitCode -eq 0) {
+            $firstLine = ($versionResult.Output -split "\r?\n")[0]
+            End-Step -Index $currentStep -Status "PASS" -Details "$firstLine ($terraformExecutable)"
+        }
+        else {
+            End-Step -Index $currentStep -Status "FAIL" -Details "terraform version failed: $($versionResult.Output)"
+        }
+    }
+
+    $currentStep = 3
+    Start-Step -Index $currentStep
+    if ([string]::IsNullOrWhiteSpace($terraformExecutable)) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform init because terraform is missing."
+    }
+    else {
+        $initResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments @("init", "-input=false", "-no-color")
         if ($initResult.ExitCode -eq 0) {
             End-Step -Index $currentStep -Status "PASS" -Details "terraform init succeeded."
         }
@@ -83,10 +103,10 @@ try {
         }
     }
 
-    $currentStep = 3
+    $currentStep = 4
     Start-Step -Index $currentStep
-    if (-not (Get-Command terraform -ErrorAction SilentlyContinue)) {
-        End-Step -Index $currentStep -Status "FAIL" -Details "terraform not found on PATH."
+    if ([string]::IsNullOrWhiteSpace($terraformExecutable)) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform destroy because terraform is missing."
     }
     else {
         $destroyArgs = @(
@@ -100,7 +120,7 @@ try {
             $destroyArgs += "-auto-approve"
         }
 
-        $destroyResult = Invoke-ExternalCapture -File "terraform" -Arguments $destroyArgs
+        $destroyResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments $destroyArgs
         if ($destroyResult.ExitCode -eq 0) {
             End-Step -Index $currentStep -Status "PASS" -Details "terraform destroy completed."
         }
@@ -109,7 +129,7 @@ try {
         }
     }
 
-    $currentStep = 4
+    $currentStep = 5
     Start-Step -Index $currentStep
     if (Test-StepFailures -Board $board) {
         End-Step -Index $currentStep -Status "FAIL" -Details "One or more steps failed."
@@ -130,7 +150,7 @@ catch {
     }
 
     if (-not $summaryDone) {
-        Set-StepStatus -Board $board -Index 4 -Status "FAIL" -Details "Unhandled error: $errorMessage"
+        Set-StepStatus -Board $board -Index 5 -Status "FAIL" -Details "Unhandled error: $errorMessage"
         Show-StepBoard -Board $board -Title "destroy.ps1 step board"
     }
 

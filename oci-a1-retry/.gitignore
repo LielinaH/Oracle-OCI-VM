@@ -1,6 +1,9 @@
 .terraform/
+.terraform.tfstate.lock.info
 *.tfstate
 *.tfstate.*
+*.tfplan
+*.tfplan.*
 crash.log
 crash.*.log
 override.tf
@@ -8,6 +11,10 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 terraform.rc
+.apply-retry.lock
+last-instance-details.md
+reports/
+run-loop-*.log
 terraform.auto.tfvars
 *.tfvars
 *.tfvars.json
