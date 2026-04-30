@@ -35,9 +35,15 @@ Operator-friendly Terraform and PowerShell workflows for provisioning Oracle Clo
 1. `Set-Location .\oci-a1-retry`
 2. Run preflight checks with `pwsh .\scripts\doctor.ps1 -TenancyOcid "<tenancy_ocid>" -Region "eu-frankfurt-1" -Profile "DEFAULT"`
 3. Deploy with `pwsh .\scripts\apply-retry.ps1 -TenancyOcid "<tenancy_ocid>" -CompartmentOcid "<compartment_ocid>" -SshPublicKeyPath "$env:USERPROFILE\.ssh\id_ed25519.pub"`
-4. Tear down with `pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoApprove $true`
+4. Tear down only with explicit approval: `pwsh .\scripts\destroy.ps1 -Region "eu-frankfurt-1" -Profile "DEFAULT" -AutoApprove`
 
 Project-specific operator guidance lives in [oci-a1-retry/README.md](./oci-a1-retry/README.md). Contribution and validation standards live in [CONTRIBUTING.md](./CONTRIBUTING.md).
+
+## Security / Cost Safety
+- OCI API keys and SSH private keys are not stored in the repo.
+- Local Terraform state and generated tfvars are ignored by git.
+- Paid shapes require an explicit override before the scripts will proceed.
+- Use a child compartment for test runs instead of the root tenancy compartment.
 
 ## Publishing Notes
 - Keep OCI API keys, SSH private keys, `terraform.tfstate`, and real `terraform.auto.tfvars` out of version control.

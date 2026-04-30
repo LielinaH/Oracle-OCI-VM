@@ -13,6 +13,7 @@ param(
     [string]$Profile = "DEFAULT",
     [string]$NamePrefix = "oci-a1-retry",
     [string]$AllowedSshCidr,
+    [switch]$AllowOpenSshFallback,
     [string]$EnforceRegion,
     [switch]$Deterministic,
     [string]$OciCliPath,
@@ -66,6 +67,9 @@ try {
 
         if (-not [string]::IsNullOrWhiteSpace($AllowedSshCidr)) {
             $applyArgs += @("-AllowedSshCidr", $AllowedSshCidr)
+        }
+        if ($AllowOpenSshFallback) {
+            $applyArgs += "-AllowOpenSshFallback"
         }
         if (-not [string]::IsNullOrWhiteSpace($EnforceRegion)) {
             $applyArgs += @("-EnforceRegion", $EnforceRegion)

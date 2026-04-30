@@ -14,6 +14,7 @@ param(
     [string]$SshPublicKeyPath,
 
     [string]$AllowedSshCidr,
+    [switch]$AllowOpenSshFallback,
     [int]$SshWaitTimeoutSeconds = 180,
     [string]$EnforceRegion,
     [switch]$Deterministic,
@@ -241,7 +242,7 @@ $steps = @(
     "Auth indicator: oci os ns get",
     "Discover ADs (dedupe; order randomized unless -Deterministic)",
     "Region policy check (default/warn; enforce option)",
-    "Detect public IP (ipify) => allowed_ssh_cidr (WARN fallback 0.0.0.0/0)",
+    "Detect public IP (ipify) => allowed_ssh_cidr",
     "Write terraform.auto.tfvars (non-secret values only)",
     "terraform init + validate (init + fmt + validate) as indicators",
     "Attempt apply with AD retry loop (show remaining attempts each try)",
@@ -621,9 +622,12 @@ try {
             $effectiveAllowedSshCidr = "$detectedIp/32"
             End-Step -Index $currentStep -Status "PASS" -Details "Detected $detectedIp. allowed_ssh_cidr=$effectiveAllowedSshCidr"
         }
-        else {
+        elseif ($AllowOpenSshFallback) {
             $effectiveAllowedSshCidr = "0.0.0.0/0"
-            End-Step -Index $currentStep -Status "WARN" -Details "ipify unavailable. Using fallback allowed_ssh_cidr=0.0.0.0/0"
+            End-Step -Index $currentStep -Status "WARN" -Details "ipify unavailable. Explicit open fallback enabled; allowed_ssh_cidr=0.0.0.0/0"
+        }
+        else {
+            End-Step -Index $currentStep -Status "FAIL" -Details "ipify unavailable and no SSH CIDR override was provided. Pass -AllowedSshCidr <cidr> or explicitly acknowledge open SSH with -AllowOpenSshFallback."
         }
     }
 

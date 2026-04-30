@@ -8,6 +8,7 @@ param(
     [string]$OciCliPath,
     [string]$TerraformPath,
     [string]$AllowedSshCidr,
+    [switch]$AllowOpenSshFallback,
     [string]$EnforceRegion,
     [int]$Ocpus = 1,
     [int]$MemoryInGbs = 6
@@ -126,7 +127,7 @@ $steps = @(
     "Auth indicator: oci os ns get (PASS/FAIL)",
     "Region policy check (default/warn; enforce option)",
     "AD discovery: oci iam availability-domain list (PASS if >=1 AD)",
-    "Public IP detect (ipify) => allowed_ssh_cidr preview (WARN if unavailable)",
+    "Public IP detect (ipify) => allowed_ssh_cidr preview",
     "terraform init (PASS/FAIL)",
     "terraform fmt -check (PASS/FAIL)",
     "terraform validate (PASS/FAIL)",
@@ -295,8 +296,11 @@ try {
         if ($detectedIp) {
             End-Step -Index $currentStep -Status "PASS" -Details "Detected $detectedIp; preview allowed_ssh_cidr=$detectedIp/32"
         }
+        elseif ($AllowOpenSshFallback) {
+            End-Step -Index $currentStep -Status "WARN" -Details "ipify unavailable; explicit open fallback enabled, preview allowed_ssh_cidr=0.0.0.0/0"
+        }
         else {
-            End-Step -Index $currentStep -Status "WARN" -Details "ipify unavailable; preview allowed_ssh_cidr=0.0.0.0/0"
+            End-Step -Index $currentStep -Status "FAIL" -Details "ipify unavailable and no SSH CIDR override was provided. Pass -AllowedSshCidr <cidr> or explicitly acknowledge open SSH with -AllowOpenSshFallback."
         }
     }
 

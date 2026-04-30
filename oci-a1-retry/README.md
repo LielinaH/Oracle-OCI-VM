@@ -36,6 +36,8 @@ oci os ns get --profile DEFAULT --region eu-frankfurt-1
   handled by your local SSH client/agent; never stored in repo
 - SSH ingress CIDR:
   optional `-AllowedSshCidr`; otherwise auto-detected via ipify and `/32`
+- Open SSH fallback:
+  disabled by default; only use `-AllowOpenSshFallback` if you intentionally want `0.0.0.0/0` when IP detection fails
 
 ## Progress Indicators
 All scripts use:
@@ -76,6 +78,7 @@ Optional strict region enforcement:
 -EnforceRegion "eu-frankfurt-1"
 -OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"
 -TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"
+-AllowOpenSshFallback
 ```
 
 ### 2) Apply With AD Retry
@@ -92,6 +95,7 @@ pwsh .\scripts\apply-retry.ps1 `
 Optional flags:
 ```powershell
 -AllowedSshCidr "203.0.113.10/32"
+-AllowOpenSshFallback
 -EnforceRegion "eu-frankfurt-1"
 -Deterministic
 -OciCliPath "C:\Program Files (x86)\Oracle\oci_cli\oci.exe"
@@ -138,7 +142,7 @@ After a successful apply, a run report is written to:
 pwsh .\scripts\destroy.ps1 `
   -Region "eu-frankfurt-1" `
   -Profile "DEFAULT" `
-  -AutoApprove $true
+  -AutoApprove
 ```
 
 Optional executable override:
@@ -157,6 +161,13 @@ pwsh .\scripts\run-loop.ps1 `
   -Profile "DEFAULT" `
   -SshPublicKeyPath "$env:USERPROFILE\.ssh\id_ed25519.pub"
 ```
+
+## Security / Cost Safety
+- OCI API keys, SSH private keys, and passphrases are never stored in the repo.
+- Local Terraform state and generated tfvars are git-ignored.
+- If public IP detection fails, the scripts now fail unless you explicitly allow open SSH with `-AllowOpenSshFallback`.
+- Paid shapes require explicit acknowledgement with `-AllowPaidShape`.
+- Use a dedicated child compartment for testing instead of the root tenancy compartment.
 
 ## Image Selection
 - Terraform selects image data with:
@@ -185,6 +196,10 @@ pwsh .\scripts\run-loop.ps1 `
 ### Terraform command resolution issues
 - If `terraform` is installed but scripts say it is missing, set:
   `-TerraformPath "$env:LOCALAPPDATA\Microsoft\WinGet\Links\terraform.exe"`
+
+### Public IP detection issues
+- If ipify is unavailable, the scripts fail by default instead of opening SSH to the world.
+- Pass `-AllowedSshCidr "<your-ip>/32"` to stay restrictive, or `-AllowOpenSshFallback` only when you intentionally want `0.0.0.0/0`.
 
 ### Safety Guards (Duplicate Prevention)
 - `apply-retry.ps1` blocks root tenancy as `-CompartmentOcid` by default. Use a child compartment for safer loops.

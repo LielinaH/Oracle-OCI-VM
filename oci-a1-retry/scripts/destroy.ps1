@@ -3,7 +3,7 @@ param(
     [string]$Region = "eu-frankfurt-1",
     [string]$Profile = "DEFAULT",
     [string]$TerraformPath,
-    [bool]$AutoApprove = $true
+    [switch]$AutoApprove
 )
 
 Set-StrictMode -Version Latest
@@ -108,17 +108,18 @@ try {
     if ([string]::IsNullOrWhiteSpace($terraformExecutable)) {
         End-Step -Index $currentStep -Status "FAIL" -Details "Cannot run terraform destroy because terraform is missing."
     }
+    elseif (-not $AutoApprove) {
+        End-Step -Index $currentStep -Status "FAIL" -Details "Refusing to run terraform destroy without explicit -AutoApprove. Destructive actions must be intentional."
+    }
     else {
         $destroyArgs = @(
             "destroy",
             "-input=false",
             "-no-color",
             "-var", "region=$Region",
-            "-var", "oci_profile=$Profile"
+            "-var", "oci_profile=$Profile",
+            "-auto-approve"
         )
-        if ($AutoApprove) {
-            $destroyArgs += "-auto-approve"
-        }
 
         $destroyResult = Invoke-ExternalCapture -File $terraformExecutable -Arguments $destroyArgs
         if ($destroyResult.ExitCode -eq 0) {
